@@ -311,7 +311,9 @@ void Stats::formatVideoStats(DX::StepTimer const& timer, VIDEO_STATS& stats, cha
 					   stats.receivedFps,
 					   stats.decodedFps,
 					   stats.renderedFps,
-					   Pacer::instance().getPacingImmediate() ? "immediate" : "display-locked");
+					   Pacer::instance().getPacingImmediate()
+					       ? (Pacer::instance().getDrainToNewest() ? "immediate, drain" : "immediate, legacy")
+					       : "display-locked");
 		if (ret < 0 || (size_t)ret >= (length - offset)) {
 			Utils::Log("Error: stringifyVideoStats length overflow\n");
 			return;

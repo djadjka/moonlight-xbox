@@ -327,6 +327,14 @@ void StreamPage::toggleFramePacing_Click(Platform::Object^ sender, Windows::UI::
 	Pacer::instance().setPacingImmediate(isImmediate ? false : true);
 }
 
+void StreamPage::toggleDrainToNewest_Click(Platform::Object^ sender, Windows::UI::Xaml::RoutedEventArgs^ e)
+{
+	// Debug A/B toggle: drain Immediate to the newest frame (on) vs the legacy
+	// single-shot catch-up (off). thread safe atomic bool
+	bool drain = Pacer::instance().getDrainToNewest();
+	Pacer::instance().setDrainToNewest(drain ? false : true);
+}
+
 void StreamPage::OnPropertyChanged(Platform::String^ propertyName)
 {
 	PropertyChanged(this, ref new Windows::UI::Xaml::Data::PropertyChangedEventArgs(propertyName));
