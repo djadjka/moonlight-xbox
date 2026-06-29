@@ -62,7 +62,7 @@
                                     <FontIcon Glyph="&#xE8B9;" />
                                 </MenuFlyoutItem.Icon>
                             </MenuFlyoutItem>
-                            <MenuFlyoutItem x:Name="toggleDrainToNewest" Text="Toggle Immediate drain (debug)" Click="toggleDrainToNewest_Click" AllowFocusOnInteraction="false" FocusVisualSecondaryThickness="0.5" >
+                            <MenuFlyoutItem x:Name="cycleImmediatePacing" Text="Cycle Immediate pacing (debug)" Click="cycleImmediatePacing_Click" AllowFocusOnInteraction="false" FocusVisualSecondaryThickness="0.5" >
                                 <MenuFlyoutItem.Icon>
                                     <FontIcon Glyph="&#xE74D;" />
                                 </MenuFlyoutItem.Icon>

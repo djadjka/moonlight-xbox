@@ -117,12 +117,15 @@ void Pacer::setPacingImmediate(bool framePacingImmediate) {
 	m_FramePacingImmediate.store(framePacingImmediate, std::memory_order_release);
 }
 
-bool Pacer::getDrainToNewest() {
-	return m_DrainToNewest.load(std::memory_order_acquire);
+int Pacer::getImmediatePacing() {
+	return m_ImmediatePacing.load(std::memory_order_acquire);
 }
 
-void Pacer::setDrainToNewest(bool drainToNewest) {
-	m_DrainToNewest.store(drainToNewest, std::memory_order_release);
+void Pacer::setImmediatePacing(int mode) {
+	if (mode < PACING_LEGACY || mode > PACING_QT) {
+		mode = PACING_DRAIN;
+	}
+	m_ImmediatePacing.store(mode, std::memory_order_release);
 }
 
 void Pacer::vsyncHardware() {
@@ -247,42 +250,85 @@ bool Pacer::renderOnMainThread(std::shared_ptr<VideoRenderer> &sceneRenderer) {
 // Pros: lowest latency, output framerate matches input framerate
 // Cons: only works well on Xbox Series for some reason
 bool Pacer::renderModeImmediate(std::shared_ptr<VideoRenderer> &sceneRenderer) {
-	AVFrame *newFrame = FrameQueue::instance().dequeue();
-	if (!newFrame) {
-		return false; // no frame, don't Present()
-	}
+	const int mode = m_ImmediatePacing.load(std::memory_order_acquire);
+	int droppedToCatchUp = 0;
+	AVFrame *newFrame = nullptr;
 
-	if (m_DrainToNewest.load(std::memory_order_acquire)) {
-		// Immediate = lowest latency: render the NEWEST available frame and discard
-		// any older ones, so no standing buffer can accumulate. The old "+1 only if
-		// count > FRAME_QUEUE_LOW" catch-up fired only once and only at depth >= 2,
-		// which left a metastable 1-frame standing buffer (output rate == input rate,
-		// so nothing pulled it back down): on a fresh connect Immediate could sit at
-		// ~2.0 frames in queue (~11.6 ms) instead of the ~1.0 frame (~4 ms) that
-		// Display-locked actively regulates to. Draining to the newest each present
-		// makes floor 0 the single stable attractor; in steady state (<= 1 queued)
-		// the loop finds nothing extra and drops nothing.
-		int droppedToCatchUp = 0;
-		for (AVFrame *newer; (newer = FrameQueue::instance().dequeue()) != nullptr;) {
-			av_frame_free(&newFrame);
-			newFrame = newer;
+	if (mode == PACING_QT) {
+		// moonlight-qt strategy: keep a rolling ~500 ms history of queue depth and
+		// drop to the floor only when the backlog is PERSISTENT, tolerating transient
+		// spikes by briefly buffering (FIFO) instead of dropping. Mirrors
+		// Pacer::handleVsync in moonlight-qt (app/.../ffmpeg-renderers/pacer/pacer.cpp).
+		const int depth = FrameQueue::instance().count();
+		int target = 1; // strict default: drop down to the newest frame
+		// Only apply leniency when the source can outpace the display; otherwise a
+		// backlog can't be sustained by rate, so stay strict (lowest latency).
+		if (m_StreamFps >= m_RefreshRate) {
+			// Decide leniency from the EXISTING history (qt uses past samples only).
+			for (int entry : m_QueueDepthHistory) {
+				if (entry <= 1) {
+					// Recently resolved to <= 1, so treat the current spike as transient
+					// and buffer up to 3 frames instead of dropping.
+					target = 3;
+					break;
+				}
+			}
+			// Then append the current depth, keeping a rolling ~500 ms window.
+			int window = static_cast<int>(m_RefreshRate / 2.0);
+			if (window < 1) {
+				window = 1;
+			}
+			if (static_cast<int>(m_QueueDepthHistory.size()) >= window) {
+				m_QueueDepthHistory.pop_front();
+			}
+			m_QueueDepthHistory.push_back(depth);
+		}
+		// Drop the OLDEST frames until we are at the target depth.
+		while (FrameQueue::instance().count() > target) {
+			AVFrame *old = FrameQueue::instance().dequeue();
+			if (!old) {
+				break;
+			}
+			av_frame_free(&old);
 			++droppedToCatchUp;
 		}
-		if (droppedToCatchUp > 0) {
-			ImGuiPlots::instance().observeFloat(PLOT_DROPPED_PACER, (float) droppedToCatchUp);
+		// Render the oldest remaining frame (FIFO when buffering, newest when strict).
+		newFrame = FrameQueue::instance().dequeue();
+		if (!newFrame) {
+			return false; // no frame, don't Present()
 		}
 	} else {
-		// Legacy single-shot catch-up (the off-by-one that leaves a metastable
-		// standing buffer). Kept behind the debug toggle for on-device A/B only.
-		int queueDepth = FrameQueue::instance().count();
-		if (queueDepth > FRAME_QUEUE_LOW) {
-			AVFrame *newFrame2 = FrameQueue::instance().dequeue();
-			if (newFrame2) {
+		newFrame = FrameQueue::instance().dequeue();
+		if (!newFrame) {
+			return false; // no frame, don't Present()
+		}
+
+		if (mode == PACING_DRAIN) {
+			// Lowest latency: render the NEWEST available frame and discard any older
+			// ones, so no standing buffer can accumulate. In steady state (<= 1 queued)
+			// the loop finds nothing extra and drops nothing.
+			for (AVFrame *newer; (newer = FrameQueue::instance().dequeue()) != nullptr;) {
 				av_frame_free(&newFrame);
-				newFrame = newFrame2;
-				ImGuiPlots::instance().observeFloat(PLOT_DROPPED_PACER, 1.0);
+				newFrame = newer;
+				++droppedToCatchUp;
+			}
+		} else {
+			// PACING_LEGACY: the original single-shot catch-up (off-by-one that leaves a
+			// metastable standing buffer). Kept for on-device A/B only.
+			int queueDepth = FrameQueue::instance().count();
+			if (queueDepth > FRAME_QUEUE_LOW) {
+				AVFrame *newFrame2 = FrameQueue::instance().dequeue();
+				if (newFrame2) {
+					av_frame_free(&newFrame);
+					newFrame = newFrame2;
+					++droppedToCatchUp;
+				}
 			}
 		}
+	}
+
+	if (droppedToCatchUp > 0) {
+		ImGuiPlots::instance().observeFloat(PLOT_DROPPED_PACER, (float) droppedToCatchUp);
 	}
 
 	if (m_CurrentFrame) {
