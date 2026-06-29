@@ -244,15 +244,23 @@ bool Pacer::renderModeImmediate(std::shared_ptr<VideoRenderer> &sceneRenderer) {
 		return false; // no frame, don't Present()
 	}
 
-	// if we're a frame behind, catch up
-	int queueDepth = FrameQueue::instance().count();
-	if (queueDepth > FRAME_QUEUE_LOW) {
-		AVFrame *newFrame2 = FrameQueue::instance().dequeue();
-		if (newFrame2) {
-			av_frame_free(&newFrame);
-			newFrame = newFrame2;
-			ImGuiPlots::instance().observeFloat(PLOT_DROPPED_PACER, 1.0);
-		}
+	// Immediate = lowest latency: render the NEWEST available frame and discard
+	// any older ones, so no standing buffer can accumulate. The old "+1 only if
+	// count > FRAME_QUEUE_LOW" catch-up fired only once and only at depth >= 2,
+	// which left a metastable 1-frame standing buffer (output rate == input rate,
+	// so nothing pulled it back down): on a fresh connect Immediate could sit at
+	// ~2.0 frames in queue (~11.6 ms) instead of the ~1.0 frame (~4 ms) that
+	// Display-locked actively regulates to. Draining to the newest each present
+	// makes floor 0 the single stable attractor; in steady state (<= 1 queued)
+	// the loop finds nothing extra and drops nothing.
+	int droppedToCatchUp = 0;
+	for (AVFrame *newer; (newer = FrameQueue::instance().dequeue()) != nullptr;) {
+		av_frame_free(&newFrame);
+		newFrame = newer;
+		++droppedToCatchUp;
+	}
+	if (droppedToCatchUp > 0) {
+		ImGuiPlots::instance().observeFloat(PLOT_DROPPED_PACER, (float) droppedToCatchUp);
 	}
 
 	if (m_CurrentFrame) {
