@@ -15,6 +15,11 @@ Stats::Stats() :
 	ZeroMemory(&m_GlobalVideoStats, sizeof(VIDEO_STATS));
 }
 
+Stats::~Stats() {
+	// Persist the in-memory CSV trace to disk once, on teardown (off the render thread).
+	flushCsv();
+}
+
 // Called every frame, if true is returned, the stats text is refreshed
 bool Stats::ShouldUpdateDisplay(DX::StepTimer const& timer, bool isVisible, char* output, size_t length)
 {
@@ -216,22 +221,10 @@ void Stats::addVideoStats(DX::StepTimer const& timer, VIDEO_STATS& src, VIDEO_ST
 // Each row is self-labelled with the active pacing mode so a session that cycles modes can
 // be split per-mode for analysis. Always-on while streaming; ~1 line/sec.
 void Stats::logCsvLine(VIDEO_STATS& s, double now) {
-	if (!m_csvLog.is_open()) {
-		try {
-			auto folder = Windows::Storage::ApplicationData::Current->LocalFolder;
-			std::wstring path(folder->Path->Data());
-			path += L"\\pacing_log.csv";
-			m_csvLog.open(path.c_str(), std::ios::app);
-		} catch (...) {
-			return;
-		}
-		if (!m_csvLog.is_open()) {
-			return;
-		}
-	}
 	if (!m_csvHeaderWritten) {
-		m_csvLog << "# --- session start ---\n"
-		         << "t_s,mode,recv_fps,dec_fps,rend_fps,frames_in_q,q_ms,render_ms,present_ms,decode_ms,net_drop_pct,pacer_drops,rtt_ms,bitrate_mbps\n";
+		m_csvBuffer.reserve(256 * 1024); // avoid reallocations during a normal session
+		m_csvBuffer += "# --- session start ---\n"
+		               "t_s,mode,recv_fps,dec_fps,rend_fps,frames_in_q,q_ms,render_ms,present_ms,decode_ms,net_drop_pct,pacer_drops,rtt_ms,bitrate_mbps\n";
 		m_csvHeaderWritten = true;
 	}
 
@@ -257,8 +250,33 @@ void Stats::logCsvLine(VIDEO_STATS& s, double now) {
 	                 m_avgQueueSize, q_ms, render_ms, present_ms, decode_ms,
 	                 net_drop, s.pacerDroppedFrames, s.lastRtt, m_bwTracker.GetAverageMbps());
 	if (n > 0) {
-		m_csvLog.write(buf, n);
-		m_csvLog.flush();
+		m_csvBuffer.append(buf, n); // pure in-memory append, no syscall on the render thread
+	}
+
+	// Safety valve for pathologically long sessions only (~4 MB ≈ 11 h); never fires in a test.
+	if (m_csvBuffer.size() > 4u * 1024 * 1024) {
+		flushCsv();
+	}
+}
+
+// Write the accumulated CSV buffer to LocalState\pacing_log.csv. Called OFF the hot path
+// (on disconnect via ~Stats, or the rare safety valve). Not locked: the only in-stream
+// caller (logCsvLine) already holds m_mutex, and the destructor runs with no contention.
+void Stats::flushCsv() {
+	if (m_csvBuffer.empty()) {
+		return;
+	}
+	try {
+		auto folder = Windows::Storage::ApplicationData::Current->LocalFolder;
+		std::wstring path(folder->Path->Data());
+		path += L"\\pacing_log.csv";
+		std::ofstream f(path.c_str(), std::ios::app | std::ios::binary);
+		if (f.is_open()) {
+			f.write(m_csvBuffer.data(), (std::streamsize) m_csvBuffer.size());
+			m_csvBuffer.clear();
+		}
+	} catch (...) {
+		// best effort
 	}
 }
 

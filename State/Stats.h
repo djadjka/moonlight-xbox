@@ -55,6 +55,7 @@ namespace moonlight_xbox_dx
 	{
 	public:
 		Stats();
+		~Stats();
 		bool ShouldUpdateDisplay(DX::StepTimer const& timer, bool isVisible, char* output, size_t length);
 
 		// submitters for various types of data
@@ -69,10 +70,11 @@ namespace moonlight_xbox_dx
 	private:
 		void addVideoStats(DX::StepTimer const& timer, VIDEO_STATS& src, VIDEO_STATS& dst);
 		void formatVideoStats(DX::StepTimer const& timer, VIDEO_STATS& stats, char* output, size_t length);
-		void logCsvLine(VIDEO_STATS& stats, double now);
+		void logCsvLine(VIDEO_STATS& stats, double now);  // render thread: append to buffer only (no I/O)
+		void flushCsv();                                  // write the buffer to disk (off the hot path)
 
 		std::mutex                           m_mutex;
-		std::ofstream                        m_csvLog;
+		std::string                          m_csvBuffer;        // in-memory CSV; flushed on disconnect
 		bool                                 m_csvHeaderWritten = false;
 
 		// Moonlight stats overlay
