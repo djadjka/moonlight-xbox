@@ -1,8 +1,11 @@
 #include "pch.h"
 #include "Stats.h"
 #include "Utils.hpp"
+#include <cmath>
+#include <fstream>
 #include "../Plot/ImGuiPlots.h"
 #include "../Streaming/FFMpegDecoder.h"
+#include "../Streaming/Pacer.h"
 
 using namespace moonlight_xbox_dx;
 
@@ -42,6 +45,13 @@ bool Stats::ShouldUpdateDisplay(DX::StepTimer const& timer, bool isVisible, char
 
 		// Accumulate these values into the global stats
 		addVideoStats(timer, m_ActiveWndVideoStats, m_GlobalVideoStats);
+
+		// CSV trace: when logging is on, snapshot the just-completed 1s window and append a row.
+		if (m_csvLogging.load(std::memory_order_acquire)) {
+			VIDEO_STATS csvStats = {};
+			addVideoStats(timer, m_ActiveWndVideoStats, csvStats);
+			logCsvLine(csvStats, timer.GetTotalSeconds());
+		}
 
 		// Move this window into the last window slot and clear it for next window
 		memcpy(&m_LastWndVideoStats, &m_ActiveWndVideoStats, sizeof(VIDEO_STATS));
@@ -149,6 +159,18 @@ void Stats::SubmitRenderStats(double preWaitTimeMs, double renderTimeMs, double 
 	m_ActiveWndVideoStats.totalPresentTimeUs += static_cast<uint64_t>(presentTimeMs * 1000);
 }
 
+// On-screen interval between consecutive NEW frames; accumulate sum + sum-of-squares so
+// logCsvLine can emit mean/stddev (= judder) and max per window.
+void Stats::SubmitFrametime(double frametimeMs) {
+	std::lock_guard<std::mutex> lock(m_mutex);
+	m_ActiveWndVideoStats.frametimeCount++;
+	m_ActiveWndVideoStats.totalFrametimeMs += frametimeMs;
+	m_ActiveWndVideoStats.totalFrametimeMsSq += frametimeMs * frametimeMs;
+	if (frametimeMs > m_ActiveWndVideoStats.maxFrametimeMs) {
+		m_ActiveWndVideoStats.maxFrametimeMs = frametimeMs;
+	}
+}
+
 /// private methods
 
 void Stats::addVideoStats(DX::StepTimer const& timer, VIDEO_STATS& src, VIDEO_STATS& dst) {
@@ -160,6 +182,10 @@ void Stats::addVideoStats(DX::StepTimer const& timer, VIDEO_STATS& src, VIDEO_ST
 	dst.pacerDroppedFrames += src.pacerDroppedFrames;
 	dst.hitDeadlines += src.hitDeadlines;
 	dst.missedDeadlines += src.missedDeadlines;
+	dst.frametimeCount += src.frametimeCount;
+	dst.totalFrametimeMs += src.totalFrametimeMs;
+	dst.totalFrametimeMsSq += src.totalFrametimeMsSq;
+	dst.maxFrametimeMs = std::max(dst.maxFrametimeMs, src.maxFrametimeMs);
 	dst.totalReassemblyTimeUs += src.totalReassemblyTimeUs;
 	dst.totalDecodeTime += src.totalDecodeTime;
 	dst.totalPacerTimeUs += src.totalPacerTimeUs;
@@ -325,6 +351,19 @@ void Stats::formatVideoStats(DX::StepTimer const& timer, VIDEO_STATS& stats, cha
 		}
 
 		offset += ret;
+
+		// Adaptive readout: the live buffer target and the two signals that drive it, so the
+		// buffer growing/reclaiming can be watched directly (decode_max = complex-scene signal).
+		if (Pacer::instance().getPacingMode() == Pacer::PACING_ADAPTIVE) {
+			ret = snprintf(&output[offset], length - offset,
+			               "Adaptive: target %d (hwm %d)  decode_max %.2f ms  jitter %.2f ms  [logging: %s]\n",
+			               Pacer::instance().getAdaptiveTarget(), Pacer::instance().getCurrentHwm(),
+			               Pacer::instance().getRecentMaxDecodeMs(), Pacer::instance().getArrivalJitterMs(),
+			               isCsvLogging() ? "ON" : "off");
+			if (ret > 0 && (size_t)ret < (length - offset)) {
+				offset += ret;
+			}
+		}
 	}
 
 	if (stats.framesWithHostProcessingLatency > 0) {
@@ -409,4 +448,87 @@ void Stats::formatVideoStats(DX::StepTimer const& timer, VIDEO_STATS& stats, cha
 		offset += ret;
 	}
 #endif
+}
+
+// Append one CSV row for the just-completed 1s window to the active log file. Called under
+// m_mutex from ShouldUpdateDisplay only while logging. Written incrementally (open/append/close
+// per line) so a crash keeps the rows already on disk.
+void Stats::logCsvLine(VIDEO_STATS& s, double now) {
+	if (m_csvPath.empty()) {
+		return;
+	}
+
+	const char* mode;
+	switch (Pacer::instance().getPacingMode()) {
+		case Pacer::PACING_DISPLAY_LOCKED: mode = "display-locked"; break;
+		case Pacer::PACING_ADAPTIVE:       mode = "adaptive";       break;
+		default:                           mode = "immediate";      break;
+	}
+
+	double q_ms       = s.renderedFrames ? (double) s.totalPacerTimeUs / 1000.0 / s.renderedFrames : 0.0;
+	double render_ms  = s.renderedFrames ? (double) s.totalRenderTimeUs / 1000.0 / s.renderedFrames : 0.0;
+	double present_ms = s.renderedFrames ? (double) s.totalPresentTimeUs / 1000.0 / s.renderedFrames : 0.0;
+	double decode_ms  = s.decodedFrames ? s.totalDecodeTime / s.decodedFrames : 0.0;
+	double net_drop   = s.totalFrames ? (double) s.networkDroppedFrames * 100.0 / s.totalFrames : 0.0;
+
+	// Frametime (judder): mean/stddev of the on-screen interval between new frames.
+	double ft_mean = s.frametimeCount ? s.totalFrametimeMs / s.frametimeCount : 0.0;
+	double ft_var  = s.frametimeCount ? (s.totalFrametimeMsSq / s.frametimeCount) - (ft_mean * ft_mean) : 0.0;
+	double ft_sd   = ft_var > 0.0 ? sqrt(ft_var) : 0.0;
+	double missed  = (s.hitDeadlines + s.missedDeadlines)
+	                     ? (double) s.missedDeadlines * 100.0 / (s.hitDeadlines + s.missedDeadlines)
+	                     : 0.0;
+
+	char buf[512];
+	int n = snprintf(buf, sizeof(buf),
+	                 "%.1f,%s,%.2f,%.2f,%.2f,%.2f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%u,%u,%.1f,%.3f,%.3f,%.3f,%.2f,%d,%d\n",
+	                 now, mode, s.receivedFps, s.decodedFps, s.renderedFps, m_avgQueueSize,
+	                 q_ms, render_ms, present_ms, decode_ms,
+	                 Pacer::instance().getRecentMaxDecodeMs(), Pacer::instance().getArrivalJitterMs(),
+	                 net_drop, s.pacerDroppedFrames, s.lastRtt, m_bwTracker.GetAverageMbps(),
+	                 ft_mean, ft_sd, s.maxFrametimeMs, missed,
+	                 Pacer::instance().getAdaptiveTarget(), Pacer::instance().getCurrentHwm());
+	if (n <= 0) {
+		return;
+	}
+	try {
+		std::ofstream f(m_csvPath.c_str(), std::ios::app | std::ios::binary);
+		if (f.is_open()) {
+			f.write(buf, n);
+		}
+	} catch (...) {
+		// best effort
+	}
+}
+
+// Begin a fresh CSV trace. Each Start writes to a NEW timestamped file in LocalState so
+// successive runs (e.g. DRAIN vs ADAPTIVE) don't mix. Pull the files via the Device Portal.
+void Stats::startCsvLogging() {
+	std::lock_guard<std::mutex> lock(m_mutex);
+	SYSTEMTIME st;
+	GetLocalTime(&st);
+	wchar_t name[80];
+	swprintf(name, 80, L"pacing_log_%04d%02d%02d_%02d%02d%02d.csv",
+	         st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute, st.wSecond);
+	try {
+		auto folder = Windows::Storage::ApplicationData::Current->LocalFolder;
+		m_csvPath = std::wstring(folder->Path->Data()) + L"\\" + name;
+		std::ofstream f(m_csvPath.c_str(), std::ios::trunc | std::ios::binary);
+		if (f.is_open()) {
+			f << "t_s,mode,recv_fps,dec_fps,rend_fps,frames_in_q,q_ms,render_ms,present_ms,"
+			     "decode_ms,decode_max_ms,jitter_ms,net_drop_pct,pacer_drops,rtt_ms,bitrate_mbps,"
+			     "ft_mean_ms,ft_sd_ms,ft_max_ms,missed_pct,adaptive_target,hwm\n";
+		}
+	} catch (...) {
+		m_csvPath.clear();
+		return;
+	}
+	m_csvLogging.store(true, std::memory_order_release);
+	Utils::Log("CSV pacing log started\n");
+}
+
+// End the current CSV trace. Rows were written incrementally, so the file is already complete.
+void Stats::stopCsvLogging() {
+	m_csvLogging.store(false, std::memory_order_release);
+	Utils::Log("CSV pacing log stopped\n");
 }

@@ -1,6 +1,7 @@
 #pragma once
 
 #include "pch.h"
+#include <atomic>
 #include <mutex>
 #include <string>
 #include "../Common/StepTimer.h"
@@ -45,6 +46,11 @@ typedef struct _VIDEO_STATS {
 	double receivedFps;
 	double decodedFps;
 	double renderedFps;
+	// On-screen frametime (interval between consecutive NEW frames) for judder analysis
+	uint32_t frametimeCount;
+	double totalFrametimeMs;
+	double totalFrametimeMsSq;
+	double maxFrametimeMs;
 	double measurementStartTimestamp;
 } VIDEO_STATS, *PVIDEO_STATS;
 
@@ -64,12 +70,22 @@ namespace moonlight_xbox_dx
 		void SubmitPacerTime(int64_t pacerTimeQpc);
 		void SubmitPresentPacing(double presentDisplayMs);
 		void SubmitRenderStats(double preWaitTimeMs, double renderTimeMs, double presentTimeMs, bool hitDeadline);
+		void SubmitFrametime(double frametimeMs);  // on-screen interval between new frames (judder)
+
+		// Manual CSV pacing trace (debug). Start opens a NEW timestamped file in LocalState and
+		// begins appending one row/second; Stop ends it. Each Start -> a fresh file for A/B runs.
+		void startCsvLogging();
+		void stopCsvLogging();
+		bool isCsvLogging() const { return m_csvLogging.load(std::memory_order_acquire); }
 
 	private:
 		void addVideoStats(DX::StepTimer const& timer, VIDEO_STATS& src, VIDEO_STATS& dst);
 		void formatVideoStats(DX::StepTimer const& timer, VIDEO_STATS& stats, char* output, size_t length);
+		void logCsvLine(VIDEO_STATS& stats, double now);  // append one row to the active log file
 
 		std::mutex                           m_mutex;
+		std::atomic<bool>                    m_csvLogging{false};
+		std::wstring                         m_csvPath;          // active log file (set on Start)
 
 		// Moonlight stats overlay
 		VIDEO_STATS                          m_ActiveWndVideoStats;

@@ -6,6 +6,7 @@
 #include "pch.h"
 #include "StreamPage.xaml.h"
 #include "../Streaming/FFMpegDecoder.h"
+#include "../State/Stats.h"
 #include <Utils.hpp>
 #include <KeyboardControl.xaml.h>
 #include "../Common/ModalDialog.xaml.h"
@@ -325,6 +326,22 @@ void StreamPage::toggleFramePacing_Click(Platform::Object^ sender, Windows::UI::
 	// Cycle Immediate -> Display-locked -> Adaptive at runtime. thread safe atomic int
 	int mode = Pacer::instance().getPacingMode();
 	Pacer::instance().setPacingMode((mode + 1) % Pacer::PACING_MODE_COUNT);
+}
+
+// Begin a new CSV pacing trace (each Start = a fresh timestamped file in LocalState).
+void StreamPage::startLogging_Click(Platform::Object^ sender, Windows::UI::Xaml::RoutedEventArgs^ e)
+{
+	if (m_deviceResources && m_deviceResources->GetStats()) {
+		m_deviceResources->GetStats()->startCsvLogging();
+	}
+}
+
+// End the current CSV pacing trace (file is already written incrementally).
+void StreamPage::stopLogging_Click(Platform::Object^ sender, Windows::UI::Xaml::RoutedEventArgs^ e)
+{
+	if (m_deviceResources && m_deviceResources->GetStats()) {
+		m_deviceResources->GetStats()->stopCsvLogging();
+	}
 }
 
 void StreamPage::OnPropertyChanged(Platform::String^ propertyName)

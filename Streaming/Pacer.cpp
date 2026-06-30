@@ -34,6 +34,10 @@
 constexpr int FRAME_QUEUE_LOW = 1;
 constexpr int FRAME_QUEUE_HIGH = 3;
 
+// PACING_ADAPTIVE decode-time signal: per-frame decode time decays by this factor each frame
+// (~0.6 s half-life @120fps), so a complex scene buffers and a clean scene reclaims latency.
+constexpr double kDecodeForget = 0.99;
+
 using steady_clock = std::chrono::steady_clock;
 using namespace moonlight_xbox_dx;
 
@@ -102,6 +106,11 @@ void Pacer::init(const std::shared_ptr<DX::DeviceResources> &res, int streamFps,
 	m_VsyncIntervalQpc = 0;
 	m_LastSyncTarget = 0;
 	m_ewmaVsyncDriftQpc = MsToQpc(0.0001);
+
+	// Reset the PACING_ADAPTIVE decode-time signal so a reconnect starts at the low-latency floor.
+	m_RecentMaxDecodeMs.store(0.0, std::memory_order_relaxed);
+	m_AdaptiveTargetPublished.store(1, std::memory_order_relaxed);
+	m_LastHwm = FRAME_QUEUE_HIGH;
 
 	// Start FrameQueue so it's ready to receive new frames
 	FrameQueue::instance().setHighWaterMark(FRAME_QUEUE_HIGH);
@@ -260,25 +269,53 @@ bool Pacer::renderModeImmediate(std::shared_ptr<VideoRenderer> &sceneRenderer) {
 	AVFrame *newFrame = nullptr;
 
 	if (mode == PACING_ADAPTIVE) {
-		// Size the drop target to the measured frame-arrival jitter (adaptive-playout
-		// style): on a clean link target == 1 (identical to IMMEDIATE), and it grows only
-		// enough to absorb transient arrival/decoder spikes. Drop the OLDEST frames down to
-		// the target, then render the oldest remaining (FIFO when buffering).
+		// Size the drop target to recent judder (adaptive-playout style): on a clean link
+		// target == 1 (identical to IMMEDIATE), and it grows only enough to absorb transient
+		// spikes, then reclaims. Two buffer-independent signals (so the controller can't
+		// oscillate) -> take the larger: network arrival jitter, and decoder overrun. Drop the
+		// OLDEST frames down to the target, then render the oldest remaining (FIFO when buffering).
 		int target = 1;
 		// Leniency only helps when the source can outpace the display; otherwise a backlog
 		// can't be sustained by rate, so stay strict (lowest latency).
 		if (m_StreamFps >= m_RefreshRate) {
 			const double frameMs = m_FrameCadence.streamPeriodMs();
-			const double jitterMs = m_ArrivalJitterMs.load(std::memory_order_acquire);
 			if (frameMs > 0.0) {
-				// Cover the jitter TAIL (RFC 3550 J is a mean deviation), rounded to whole
-				// frames; trivial jitter rounds to 0 extra -> target 1 (== IMMEDIATE).
+				// Network-jitter term (RFC 3550 J, a mean deviation): cover the jitter tail,
+				// rounded to whole frames; trivial jitter rounds to 0 extra -> target 1.
+				const double jitterMs = m_ArrivalJitterMs.load(std::memory_order_acquire);
 				const double kJitterSafety = 2.0;
-				int extra = static_cast<int>(((jitterMs * kJitterSafety) / frameMs) + 0.5);
-				target = 1 + extra;
-				if (target > 4) { // cap; FrameQueue holds ~5
-					target = 4;
+				int jitterDepth = 1 + static_cast<int>(((jitterMs * kJitterSafety) / frameMs) + 0.5);
+
+				// Complex-scene term: grow when the decoder OVERRUNS the per-frame budget. At or
+				// under the decode ceiling (overrun <= 0) this is 1, so merely running the decoder
+				// hard at a steady rate stays at lowest latency; only genuine overruns (a hard
+				// frame taking > 1 period) buffer, and it reclaims as the decaying max falls.
+				const double decodeMs = m_RecentMaxDecodeMs.load(std::memory_order_relaxed);
+				int decodeDepth = 1;
+				const double overrunMs = decodeMs - frameMs;
+				if (overrunMs > 0.0) {
+					int extra = static_cast<int>(overrunMs / frameMs);
+					if (overrunMs > extra * frameMs) extra += 1; // ceil
+					decodeDepth = 1 + extra;
 				}
+
+				target = jitterDepth > decodeDepth ? jitterDepth : decodeDepth;
+				if (target > 3) { // cap: 2-3 is the useful range; 4 = needless latency at 120Hz
+					target = 3;
+				}
+			}
+		}
+		m_AdaptiveTargetPublished.store(target, std::memory_order_relaxed);
+		// Let the queue hold `target` frames plus one arriving, so a grown buffer retains the
+		// NEWEST frames instead of the high-water alternate-drop discarding new arrivals. Only
+		// touch the (locked) high-water on an actual change.
+		{
+			int hwm = target + 1;
+			if (hwm < FRAME_QUEUE_HIGH) hwm = FRAME_QUEUE_HIGH;
+			if (hwm > 5) hwm = 5; // FrameQueue capacity
+			if (hwm != m_LastHwm) {
+				FrameQueue::instance().setHighWaterMark(hwm);
+				m_LastHwm = hwm;
 			}
 		}
 		while (FrameQueue::instance().count() > target) {
@@ -426,6 +463,34 @@ int64_t Pacer::getCurrentFramePts() {
 // end main thread
 
 // called by decoder thread
+// Per-frame decode time, fed by the decoder thread for NON-IDR frames only (an IDR is large
+// and slow by nature; including it would falsely pin the buffer). Keeps a decaying max so a
+// complex scene raises the signal and a clean scene reclaims latency. Single writer (decoder
+// thread); the render thread only reads m_RecentMaxDecodeMs, so the RMW here is race-free.
+void Pacer::observeDecodeMs(double decodeMs) {
+	double cur = m_RecentMaxDecodeMs.load(std::memory_order_relaxed) * kDecodeForget;
+	if (decodeMs > cur) {
+		cur = decodeMs;
+	}
+	m_RecentMaxDecodeMs.store(cur, std::memory_order_relaxed);
+}
+
+int Pacer::getAdaptiveTarget() {
+	return m_AdaptiveTargetPublished.load(std::memory_order_relaxed);
+}
+
+double Pacer::getRecentMaxDecodeMs() {
+	return m_RecentMaxDecodeMs.load(std::memory_order_relaxed);
+}
+
+double Pacer::getArrivalJitterMs() {
+	return m_ArrivalJitterMs.load(std::memory_order_acquire);
+}
+
+int Pacer::getCurrentHwm() {
+	return m_LastHwm;
+}
+
 void Pacer::submitFrame(AVFrame *frame) {
 	// Update cadence from pts if available
 	if (frame->pts) {

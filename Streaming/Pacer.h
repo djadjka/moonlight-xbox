@@ -40,6 +40,12 @@ class Pacer {
 	int64_t getCurrentFramePts();
 	int64_t getNextVBlankQpc(int64_t *now);
 	void submitFrame(AVFrame *frame);
+	void observeDecodeMs(double decodeMs);  // decoder thread: per-frame decode time (PACING_ADAPTIVE)
+	// Live PACING_ADAPTIVE signals/state for the stats overlay + CSV trace.
+	int    getAdaptiveTarget();             // current buffer depth target
+	double getRecentMaxDecodeMs();          // decaying-max decode time (complex-scene signal)
+	double getArrivalJitterMs();            // RFC 3550 arrival jitter (network signal)
+	int    getCurrentHwm();                 // current FrameQueue high-water
 
   private:
 	Pacer();
@@ -71,6 +77,13 @@ class Pacer {
 	std::atomic<double> m_ArrivalJitterMs{0.0};
 	int64_t m_LastEnqueueQpc = 0;
 	bool m_HaveLastEnqueue = false;
+	// Decaying max of recent per-frame decode time (ms), fed by observeDecodeMs on the decoder
+	// thread (non-IDR frames only). A complex scene -> decode overruns the frame budget -> this
+	// rises -> PACING_ADAPTIVE buffers; it decays back so the buffer reclaims latency when decode
+	// gets easy. Buffer-independent (decode duration is upstream of the queue) -> can't oscillate.
+	std::atomic<double> m_RecentMaxDecodeMs{0.0};
+	int m_LastHwm = 3;  // render thread: last high-water set (== FRAME_QUEUE_HIGH; avoids re-locking)
+	std::atomic<int> m_AdaptiveTargetPublished{1};  // current target, for the overlay/CSV
 
 	FrameCadence m_FrameCadence;
 	AVFrame* m_CurrentFrame = nullptr;
