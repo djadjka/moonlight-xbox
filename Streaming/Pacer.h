@@ -18,10 +18,22 @@ class Pacer {
 	// Singleton accessor
 	static Pacer &instance();
 
+	// Frame pacing mode (selected in host settings / quick menu). IMMEDIATE renders the
+	// newest decoded frame and drops older ones for lowest latency; ADAPTIVE additionally
+	// buffers to the measured arrival jitter to absorb transient spikes; DISPLAY_LOCKED
+	// presents every vblank via the cadence accumulator.
+	enum PacingMode {
+		PACING_IMMEDIATE = 0,
+		PACING_DISPLAY_LOCKED = 1,
+		PACING_ADAPTIVE = 2,
+		PACING_MODE_COUNT = 3,
+	};
+
 	void deinit();
-	void init(const std::shared_ptr<DX::DeviceResources> &res, int maxVideoFps, double refreshRate, bool framePacingImmediate);
-	bool getPacingImmediate();
-	void setPacingImmediate(bool framePacingImmediate);
+	void init(const std::shared_ptr<DX::DeviceResources> &res, int maxVideoFps, double refreshRate, int pacingMode);
+	bool getPacingImmediate();  // = mode != DISPLAY_LOCKED (kept for stats compatibility)
+	int getPacingMode();
+	void setPacingMode(int mode);
 	void waitForFrame(double timeoutMs);
 	bool renderOnMainThread(std::shared_ptr<moonlight_xbox_dx::VideoRenderer> &sceneRenderer);
 	bool waitBeforePresent(int64_t deadline);
@@ -53,7 +65,12 @@ class Pacer {
 	std::atomic<bool> m_Stopping{false};
 	int m_StreamFps;
 	double m_RefreshRate;
-	std::atomic<bool> m_FramePacingImmediate;
+	std::atomic<int> m_PacingMode{PACING_IMMEDIATE};
+	// Smoothed frame-arrival jitter (ms, RFC 3550), measured in submitFrame on the decoder
+	// thread; read by PACING_ADAPTIVE to size the drop target.
+	std::atomic<double> m_ArrivalJitterMs{0.0};
+	int64_t m_LastEnqueueQpc = 0;
+	bool m_HaveLastEnqueue = false;
 
 	FrameCadence m_FrameCadence;
 	AVFrame* m_CurrentFrame = nullptr;

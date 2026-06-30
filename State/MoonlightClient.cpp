@@ -314,7 +314,13 @@ int MoonlightClient::StartStreaming(std::shared_ptr<DX::DeviceResources> res, St
 	callbacks.rumble = connection_rumble;
 	callbacks.rumbleTriggers = connection_trigger_rumble;
 
-	FFMpegDecoder::instance().CompleteInitialization(res, &config, sConfig->framePacing == "Immediate");
+	int pacingMode = Pacer::PACING_IMMEDIATE;
+	if (sConfig->framePacing == "Display-locked") {
+		pacingMode = Pacer::PACING_DISPLAY_LOCKED;
+	} else if (sConfig->framePacing == "Adaptive") {
+		pacingMode = Pacer::PACING_ADAPTIVE;
+	}
+	FFMpegDecoder::instance().CompleteInitialization(res, &config, pacingMode);
 	DECODER_RENDERER_CALLBACKS rCallbacks = FFMpegDecoder::getDecoder();
 
 	AUDIO_RENDERER_CALLBACKS aCallbacks = AudioPlayer::getDecoder();

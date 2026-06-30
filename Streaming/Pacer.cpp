@@ -49,7 +49,6 @@ Pacer::Pacer()
       m_Stopping(false),
       m_StreamFps(0),
       m_RefreshRate(0.0),
-      m_FramePacingImmediate(true),
       m_FrameCadence(),
       m_LastSyncRefreshCount(0),
       m_LastSyncQpc(0),
@@ -78,17 +77,23 @@ void Pacer::deinit() {
 	Utils::Logf("Pacer: deinit\n");
 }
 
-void Pacer::init(const std::shared_ptr<DX::DeviceResources> &res, int streamFps, double refreshRate, bool framePacingImmediate) {
+void Pacer::init(const std::shared_ptr<DX::DeviceResources> &res, int streamFps, double refreshRate, int pacingMode) {
 	m_Stopping.store(false, std::memory_order_release);
 	m_DeviceResources = res;
 	m_StreamFps = streamFps;
 	m_RefreshRate = refreshRate;
-	m_FramePacingImmediate.store(framePacingImmediate, std::memory_order_release);
+	if (pacingMode < 0 || pacingMode >= PACING_MODE_COUNT) {
+		pacingMode = PACING_IMMEDIATE;
+	}
+	m_PacingMode.store(pacingMode, std::memory_order_release);
 
 	m_FrameCadence.init(m_RefreshRate > 0.0 ? m_RefreshRate : 60.0, static_cast<double>(streamFps));
 
+	const char *modeName = pacingMode == PACING_DISPLAY_LOCKED ? "display-locked"
+	                       : pacingMode == PACING_ADAPTIVE     ? "adaptive"
+	                                                           : "immediate";
 	Utils::Logf("Frame Pacer init: mode %s, streamFps %d, refreshRate %.2f\n",
-	            framePacingImmediate ? "immediate" : "display-locked", m_StreamFps, m_RefreshRate);
+	            modeName, m_StreamFps, m_RefreshRate);
 
 	m_vhsum = 0;
 	m_vhcount = 0;
@@ -110,11 +115,18 @@ void Pacer::init(const std::shared_ptr<DX::DeviceResources> &res, int streamFps,
 }
 
 bool Pacer::getPacingImmediate() {
-	return m_FramePacingImmediate.load(std::memory_order_acquire);
+	return m_PacingMode.load(std::memory_order_acquire) != PACING_DISPLAY_LOCKED;
 }
 
-void Pacer::setPacingImmediate(bool framePacingImmediate) {
-	m_FramePacingImmediate.store(framePacingImmediate, std::memory_order_release);
+int Pacer::getPacingMode() {
+	return m_PacingMode.load(std::memory_order_acquire);
+}
+
+void Pacer::setPacingMode(int mode) {
+	if (mode < 0 || mode >= PACING_MODE_COUNT) {
+		mode = PACING_IMMEDIATE;
+	}
+	m_PacingMode.store(mode, std::memory_order_release);
 }
 
 void Pacer::vsyncHardware() {
@@ -227,32 +239,77 @@ void Pacer::waitForFrame(double timeoutMs) {
 bool Pacer::renderOnMainThread(std::shared_ptr<VideoRenderer> &sceneRenderer) {
 	if (!running()) return false;
 
-	if (m_FramePacingImmediate.load(std::memory_order_acquire)) {
-		return renderModeImmediate(sceneRenderer);
-	} else {
+	if (m_PacingMode.load(std::memory_order_acquire) == PACING_DISPLAY_LOCKED) {
 		return renderModeDisplayLocked(sceneRenderer);
+	} else {
+		// IMMEDIATE and ADAPTIVE share the immediate render path; they differ only in
+		// how many older frames are dropped before rendering.
+		return renderModeImmediate(sceneRenderer);
 	}
 }
 
 // Dequeue a new frame if available and immediately render it. When no new frame is available
 // skips Present and relies on the system to continue showing the previous frame.
+// Handles both PACING_IMMEDIATE (render the newest frame, drop all older) and PACING_ADAPTIVE
+// (drop down to a jitter-sized target, keeping a small buffer to absorb transient spikes).
 // Pros: lowest latency, output framerate matches input framerate
 // Cons: only works well on Xbox Series for some reason
 bool Pacer::renderModeImmediate(std::shared_ptr<VideoRenderer> &sceneRenderer) {
-	AVFrame *newFrame = FrameQueue::instance().dequeue();
-	if (!newFrame) {
-		return false; // no frame, don't Present()
+	const int mode = m_PacingMode.load(std::memory_order_acquire);
+	int droppedToCatchUp = 0;
+	AVFrame *newFrame = nullptr;
+
+	if (mode == PACING_ADAPTIVE) {
+		// Size the drop target to the measured frame-arrival jitter (adaptive-playout
+		// style): on a clean link target == 1 (identical to IMMEDIATE), and it grows only
+		// enough to absorb transient arrival/decoder spikes. Drop the OLDEST frames down to
+		// the target, then render the oldest remaining (FIFO when buffering).
+		int target = 1;
+		// Leniency only helps when the source can outpace the display; otherwise a backlog
+		// can't be sustained by rate, so stay strict (lowest latency).
+		if (m_StreamFps >= m_RefreshRate) {
+			const double frameMs = m_FrameCadence.streamPeriodMs();
+			const double jitterMs = m_ArrivalJitterMs.load(std::memory_order_acquire);
+			if (frameMs > 0.0) {
+				// Cover the jitter TAIL (RFC 3550 J is a mean deviation), rounded to whole
+				// frames; trivial jitter rounds to 0 extra -> target 1 (== IMMEDIATE).
+				const double kJitterSafety = 2.0;
+				int extra = static_cast<int>(((jitterMs * kJitterSafety) / frameMs) + 0.5);
+				target = 1 + extra;
+				if (target > 4) { // cap; FrameQueue holds ~5
+					target = 4;
+				}
+			}
+		}
+		while (FrameQueue::instance().count() > target) {
+			AVFrame *old = FrameQueue::instance().dequeue();
+			if (!old) {
+				break;
+			}
+			av_frame_free(&old);
+			++droppedToCatchUp;
+		}
+		newFrame = FrameQueue::instance().dequeue();
+		if (!newFrame) {
+			return false; // no frame, don't Present()
+		}
+	} else {
+		// PACING_IMMEDIATE: lowest latency. Render the NEWEST available frame and discard
+		// any older ones, so no standing buffer can accumulate. In steady state (<= 1
+		// queued) the loop finds nothing extra and drops nothing.
+		newFrame = FrameQueue::instance().dequeue();
+		if (!newFrame) {
+			return false; // no frame, don't Present()
+		}
+		for (AVFrame *newer; (newer = FrameQueue::instance().dequeue()) != nullptr;) {
+			av_frame_free(&newFrame);
+			newFrame = newer;
+			++droppedToCatchUp;
+		}
 	}
 
-	// if we're a frame behind, catch up
-	int queueDepth = FrameQueue::instance().count();
-	if (queueDepth > FRAME_QUEUE_LOW) {
-		AVFrame *newFrame2 = FrameQueue::instance().dequeue();
-		if (newFrame2) {
-			av_frame_free(&newFrame);
-			newFrame = newFrame2;
-			ImGuiPlots::instance().observeFloat(PLOT_DROPPED_PACER, 1.0);
-		}
+	if (droppedToCatchUp > 0) {
+		ImGuiPlots::instance().observeFloat(PLOT_DROPPED_PACER, (float) droppedToCatchUp);
 	}
 
 	if (m_CurrentFrame) {
@@ -374,6 +431,22 @@ void Pacer::submitFrame(AVFrame *frame) {
 	if (frame->pts) {
 		m_FrameCadence.observeFramePts(frame->pts);
 	}
+
+	// Measure frame-arrival jitter as the RFC 3550 smoothed deviation of the actual
+	// inter-arrival time from the expected frame period: J += (|D| - J)/16. Read by
+	// PACING_ADAPTIVE to size the buffer target. Cheap; decoder thread only.
+	int64_t now = QpcNow();
+	if (m_HaveLastEnqueue) {
+		double arrivalDeltaMs = QpcToMs(now - m_LastEnqueueQpc);
+		double dev = arrivalDeltaMs - m_FrameCadence.streamPeriodMs();
+		if (dev < 0.0) {
+			dev = -dev;
+		}
+		double j = m_ArrivalJitterMs.load(std::memory_order_acquire);
+		m_ArrivalJitterMs.store(j + (dev - j) / 16.0, std::memory_order_release);
+	}
+	m_LastEnqueueQpc = now;
+	m_HaveLastEnqueue = true;
 
 	int dropCount = FrameQueue::instance().enqueue(frame);
 	if (dropCount) {
