@@ -52,6 +52,8 @@ class Pacer {
 		int    maxBurst;      // largest loss burst seen (frames) -> drives the needed depth
 		int    neededDepth;   // buffer depth this scene needs (1 + maxBurst, +safety)
 		double avgTarget;     // mean buffer depth the controller actually used
+		double recentBurst;   // decaying max of arrivals/present-interval (primary growth signal)
+		int    arrived;       // last interval's arrivals (1 = steady, >=2 = burst)
 		double stutterPer1k;  // residual render-starves per 1000 presents (validation)
 		double meanPressure;  // mean decaying loss pressure (threshold x-axis)
 		double score;         // objective = stutterPer1k + 10*(avgTarget-1)
@@ -112,6 +114,16 @@ class Pacer {
 	std::atomic<uint64_t> m_LostFrameEvents{0};      // lost frames seen at enqueue (decoder->render)
 	int64_t m_LastFramePts = 0;      // previous enqueued pts (decoder thread, PTS gap detect)
 	bool    m_HaveLastPts = false;   // decoder thread only
+	// Primary growth signal: arrivals-per-present-interval. submitFrame (decoder) counts every
+	// delivered frame; the render thread reads+clears it once per present, so the value is how
+	// many frames piled up between two on-screen presents. Steady state == 1; a decode
+	// stall+catch-up, a jitter clump, or a consumer present-hitch all deliver >= 2 in one
+	// interval -- and unlike a starve/drop, this count does NOT change when the buffer engages
+	// (holding more frames doesn't alter how many ARRIVE between presents), so it can't
+	// oscillate. m_RecentBurst is its decaying max -> the buffer depth needed to absorb it.
+	std::atomic<int> m_ArrivalsSincePresent{0};  // decoder thread increments, render clears
+	double m_RecentBurst = 1.0;                  // decaying max of arrivals/interval (render thread)
+	int    m_LastArrived = 0;                    // last interval's arrivals (overlay only)
 	// Live-tunable PACING_ADAPTIVE constants (defaults here; overridable on-device via
 	// LocalState\pacing_params.txt + loadTuningParams, so no rebuild to tune).
 	std::atomic<double> m_pStarveForget{0.997};          // per-present decay (~2.8 s memory @120fps)
@@ -119,6 +131,7 @@ class Pacer {
 	std::atomic<double> m_pStarveP2{6.0};                // pressure -> target 3
 	std::atomic<double> m_pStarveP3{12.0};               // pressure -> target 4
 	std::atomic<int>    m_pStarveShrinkHoldFrames{120};  // presents of lower demand before stepping down
+	std::atomic<double> m_pBurstForget{0.995};           // arrivals-burst decay (~1.8 s reclaim @120fps)
 
 	// --- On-device auto-tuner (debug) -----------------------------------------------
 	// Per-condition COUNT accumulators (not EWMA snapshots), bucketed by the auto-detected

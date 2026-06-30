@@ -474,9 +474,9 @@ void Stats::formatVideoStats(DX::StepTimer const& timer, VIDEO_STATS& stats, cha
 			const char *condName = tv.cond == Pacer::COND_CLEAN ? "clean"
 			                     : tv.cond == Pacer::COND_PACING ? "pacing-drops" : "network-drops";
 			ret = snprintf(&output[offset], length - offset,
-			               "Tune[%s] n=%.0f loss/1k=%.1f(x%d) need=%d tgt=%.2f stut=%.1f/1k p=%.1f/%.1f/%.1f\n",
-			               condName, tv.samples, tv.lossPer1k, tv.maxBurst, tv.neededDepth,
-			               tv.avgTarget, tv.stutterPer1k, tv.p1, tv.p2, tv.p3);
+			               "Tune[%s] tgt=%d burst=%.1f arr=%d | loss/1k=%.1f(x%d) stut=%.1f/1k n=%.0f\n",
+			               condName, Pacer::instance().getAdaptiveTarget(), tv.recentBurst, tv.arrived,
+			               tv.lossPer1k, tv.maxBurst, tv.stutterPer1k, tv.samples);
 			if (ret > 0 && (size_t)ret < (length - offset)) {
 				offset += ret;
 			}

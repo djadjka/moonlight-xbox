@@ -131,6 +131,9 @@ void Pacer::init(const std::shared_ptr<DX::DeviceResources> &res, int streamFps,
 	m_AdaptiveTargetPublished.store(1, std::memory_order_release);
 	m_LostFrameEvents.store(0, std::memory_order_release);
 	m_HaveLastPts = false;
+	m_ArrivalsSincePresent.store(0, std::memory_order_release);
+	m_RecentBurst = 1.0;
+	m_LastArrived = 0;
 	clearTunerStats();
 
 	// Start FrameQueue so it's ready to receive new frames
@@ -209,11 +212,12 @@ void Pacer::loadTuningParams() {
 				else if (key == "p2")          m_pStarveP2.store(std::stod(val), std::memory_order_relaxed);
 				else if (key == "p3")          m_pStarveP3.store(std::stod(val), std::memory_order_relaxed);
 				else if (key == "shrink_hold") m_pStarveShrinkHoldFrames.store(std::stoi(val), std::memory_order_relaxed);
+				else if (key == "burst_forget") m_pBurstForget.store(std::stod(val), std::memory_order_relaxed);
 			} catch (...) { /* skip a malformed value */ }
 		}
-		Utils::Logf("Pacer adaptive tuning: forget=%.4f p1=%.2f p2=%.2f p3=%.2f shrink_hold=%d\n",
+		Utils::Logf("Pacer adaptive tuning: forget=%.4f p1=%.2f p2=%.2f p3=%.2f shrink_hold=%d burst_forget=%.4f\n",
 		            m_pStarveForget.load(), m_pStarveP1.load(), m_pStarveP2.load(),
-		            m_pStarveP3.load(), m_pStarveShrinkHoldFrames.load());
+		            m_pStarveP3.load(), m_pStarveShrinkHoldFrames.load(), m_pBurstForget.load());
 	} catch (...) {
 		// best effort
 	}
@@ -295,6 +299,8 @@ Pacer::TuneView Pacer::getTuneView() {
 	v.maxBurst = maxK;
 	v.neededDepth = neededDepthFor(c);
 	v.avgTarget = n > 0.0 ? m_CondTargetSum[c] / n : 1.0;
+	v.recentBurst = m_RecentBurst;
+	v.arrived = m_LastArrived;
 	v.stutterPer1k = n > 0.0 ? m_CondStarves[c] / n * 1000.0 : 0.0;
 	v.meanPressure = n > 0.0 ? m_CondPressSum[c] / n : 0.0;
 	v.score = v.stutterPer1k + 10.0 * (v.avgTarget - 1.0);
@@ -356,6 +362,7 @@ void Pacer::recomputeWeights() {
 			f << "p2=" << newP[1] << "\n";
 			f << "p3=" << newP[2] << "\n";
 			f << "shrink_hold=" << m_pStarveShrinkHoldFrames.load() << "\n";
+			f << "burst_forget=" << m_pBurstForget.load() << "\n";
 		}
 	} catch (...) {
 		// best effort
@@ -552,22 +559,37 @@ bool Pacer::renderModeImmediate(std::shared_ptr<VideoRenderer> &sceneRenderer) {
 				}
 				m_QueueDepthHistory.push_back(depth);
 			} else {
-				// PACING_ADAPTIVE: size the buffer to recent judder from ANY source
-				// (decoder drops, network loss/spikes) via a decaying controller. Grow
-				// fast, shrink slow, so the buffer engages only while judder persists and
-				// returns to 1 (== DRAIN latency) when the link is clean. The signal is the
-				// producer-side lost-frame count from submitFrame, decoupled from the
-				// render buffer so it doesn't collapse when the buffer engages.
+				// PACING_ADAPTIVE: size the buffer to recent judder via a decaying controller.
+				// Grow fast, shrink slow, so it engages only while judder persists and returns
+				// to 1 (== DRAIN latency) when clean. Two signals feed it: arrivals-per-present
+				// (primary, catches every contiguous-PTS pile-up) and producer-side PTS-gap loss
+				// (secondary, catches genuine skips) -- both decoupled from the buffer depth so
+				// the controller can't oscillate.
 				uint64_t lostNow = m_LostFrameEvents.load(std::memory_order_acquire);
 				double newLost = static_cast<double>(lostNow - m_LastLostSeen);
 				m_LastLostSeen = lostNow;
-				m_StarvePressure = m_StarvePressure * m_pStarveForget.load(std::memory_order_relaxed) + newLost;
 
-				// Reactive term: map the decaying loss rate to a buffer depth.
-				int desired = 1;
-				if (m_StarvePressure >= m_pStarveP1.load(std::memory_order_relaxed)) desired = 2;
-				if (m_StarvePressure >= m_pStarveP2.load(std::memory_order_relaxed)) desired = 3;
-				if (m_StarvePressure >= m_pStarveP3.load(std::memory_order_relaxed)) desired = 4;
+				// PRIMARY signal: arrivals-per-present-interval. Clear the decoder-side counter
+				// for this present; the value is how many frames piled up since the last one.
+				// A burst of K (decode catch-up / jitter clump / consumer hitch) needs a buffer
+				// ~K deep to present them one-per-vblank instead of dropping. Decaying max so it
+				// grows on a burst and reclaims latency (-> 1) when arrivals settle back to 1.
+				// Unlike a drop/starve, this count is independent of the buffer depth -> no
+				// oscillation. This catches the contiguous-PTS drops the loss signal cannot see.
+				int arrived = m_ArrivalsSincePresent.exchange(0, std::memory_order_relaxed);
+				if (arrived > 8) arrived = 8; // clamp a mode-switch backlog
+				m_LastArrived = arrived;
+				m_RecentBurst *= m_pBurstForget.load(std::memory_order_relaxed);
+				if ((double) arrived > m_RecentBurst) m_RecentBurst = (double) arrived;
+				if (m_RecentBurst < 1.0) m_RecentBurst = 1.0;
+				int desired = static_cast<int>(m_RecentBurst + 0.5);
+
+				// Secondary: genuine producer-side loss (PTS gaps) -- decoder/network SKIPS,
+				// which the arrivals signal doesn't see (a skipped frame never arrives).
+				m_StarvePressure = m_StarvePressure * m_pStarveForget.load(std::memory_order_relaxed) + newLost;
+				if (m_StarvePressure >= m_pStarveP1.load(std::memory_order_relaxed) && desired < 2) desired = 2;
+				if (m_StarvePressure >= m_pStarveP2.load(std::memory_order_relaxed) && desired < 3) desired = 3;
+				if (m_StarvePressure >= m_pStarveP3.load(std::memory_order_relaxed) && desired < 4) desired = 4;
 
 				// Predictive floor: pre-buffer sustained network arrival jitter (RFC 3550
 				// tail) before it turns into starves.
@@ -579,12 +601,13 @@ bool Pacer::renderModeImmediate(std::shared_ptr<VideoRenderer> &sceneRenderer) {
 						desired = floorTarget;
 					}
 				}
-				if (desired > 4) { // cap (FrameQueue holds ~5)
+				if (desired > 4) { // cap (FrameQueue capacity is 5)
 					desired = 4;
 				}
 
 				// Grow fast, shrink slow: jump up immediately; step down one only after the
 				// lower demand has held for m_pStarveShrinkHoldFrames (anti-oscillation).
+				const int prevTarget = m_AdaptiveTarget;
 				if (desired > m_AdaptiveTarget) {
 					m_AdaptiveTarget = desired;
 					m_ShrinkHoldFrames = 0;
@@ -598,6 +621,17 @@ bool Pacer::renderModeImmediate(std::shared_ptr<VideoRenderer> &sceneRenderer) {
 				}
 				target = m_AdaptiveTarget;
 				m_AdaptiveTargetPublished.store(target, std::memory_order_release);
+
+				// Coordinate the enqueue cap with the target: the queue must be allowed to hold
+				// `target` frames plus one arriving, or a grown buffer can't actually fill (the
+				// high-water alternate-drop would discard the burst at enqueue before the render
+				// loop could retain it). Only touch it on a change (it locks FrameQueue).
+				if (m_AdaptiveTarget != prevTarget) {
+					int hwm = m_AdaptiveTarget + 1;
+					if (hwm < FRAME_QUEUE_HIGH) hwm = FRAME_QUEUE_HIGH;
+					if (hwm > 5) hwm = 5; // FrameQueue capacity
+					FrameQueue::instance().setHighWaterMark(hwm);
+				}
 
 				// Auto-tuner accumulator (debug): count this adaptive tick under the detected
 				// scene and sum the signals the fit needs. Counts (not EWMAs) so the fit is
@@ -796,6 +830,11 @@ void Pacer::submitFrame(AVFrame *frame) {
 		m_LastFramePts = frame->pts;
 		m_HaveLastPts = true;
 	}
+
+	// Primary growth signal for PACING_ADAPTIVE: count this delivered frame. The render thread
+	// clears this once per present, so it reads as arrivals-per-present-interval. Counted before
+	// the enqueue drop so a burst that overflows the queue still registers its true size.
+	m_ArrivalsSincePresent.fetch_add(1, std::memory_order_relaxed);
 
 	int dropCount = FrameQueue::instance().enqueue(frame);
 	if (dropCount) {
