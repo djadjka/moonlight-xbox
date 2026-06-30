@@ -201,10 +201,16 @@ void Pacer::loadTuningParams() {
 	}
 }
 
-// Clear the CSV pacing trace so the next on-device test starts clean (debug button).
+// Clear the CSV pacing trace AND the auto-tuner stats so the next on-device measurement
+// starts from a clean slate (debug button).
 void Pacer::resetTraceLogs() {
 	if (m_DeviceResources && m_DeviceResources->GetStats()) {
 		m_DeviceResources->GetStats()->resetCsv();
+	}
+	for (int c = 0; c < COND_COUNT; ++c) {
+		m_CondTarget[c] = 1.0;
+		m_CondStarve[c] = 0.0;
+		m_CondPressure[c] = 0.0;
 	}
 }
 
@@ -285,6 +291,15 @@ void Pacer::recomputeWeights() {
 	}
 	Utils::Logf("Pacer recompute: needed[clean=%d pacing=%d net=%d] -> p1=%.2f p2=%.2f p3=%.2f\n",
 	            needed[COND_CLEAN], needed[COND_PACING], needed[COND_NETWORK], newP[0], newP[1], newP[2]);
+
+	// Start the next tuning iteration from a clean slate: clear the per-condition stats so
+	// the next Recompute fits only behaviour observed under the weights just applied (no
+	// carry-over from prior iterations).
+	for (int c = 0; c < COND_COUNT; ++c) {
+		m_CondTarget[c] = 1.0;
+		m_CondStarve[c] = 0.0;
+		m_CondPressure[c] = 0.0;
+	}
 }
 
 void Pacer::vsyncHardware() {
