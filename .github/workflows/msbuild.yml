@@ -29,14 +29,36 @@ jobs:
     - name: Add MSBuild to PATH
       uses: microsoft/setup-msbuild@v2
 
+    # Cache the (rarely-changing) third-party build: vcpkg packages + the cmake
+    # project dirs. The "Build third party tools" step rebuilds vcpkg deps from
+    # source (~21 min) on every cold run; with a warm cache it reconfigures in
+    # seconds. The main app is NOT cached, so source changes always recompile.
+    - name: Record third-party state (cache key)
+      run: git submodule status > submodule-status.txt
+
+    - name: Cache third-party + vcpkg build
+      id: cache3p
+      uses: actions/cache@v4
+      with:
+        path: |
+          vcpkg_installed
+          third_party/moonlight-common-c/build
+          libgamestream/build
+          ~/AppData/Local/vcpkg/archives
+        key: thirdparty-${{ runner.os }}-${{ hashFiles('vcpkg.json', 'submodule-status.txt', 'generate-thirdparty-projects.bat') }}
+        restore-keys: |
+          thirdparty-${{ runner.os }}-
+
     - name: Restore VCPKG packages
+      if: steps.cache3p.outputs.cache-hit != 'true'
       run: |
         Invoke-WebRequest `
           -Uri "https://github.com/TheElixZammuto/moonlight-xbox/releases/download/1.10.0/vcpkg_installed.zip" `
           -OutFile .\vcpkg_installed.zip
 
     - name: Extract VCPKG packages
-      run: Expand-Archive .\vcpkg_installed.zip -DestinationPath .\
+      if: steps.cache3p.outputs.cache-hit != 'true'
+      run: Expand-Archive .\vcpkg_installed.zip -DestinationPath .\ -Force
 
     - name: List VCPKG packages
       run: dir .\vcpkg_installed
