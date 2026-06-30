@@ -72,11 +72,6 @@
                                     <FontIcon Glyph="&#xE74D;" />
                                 </MenuFlyoutItem.Icon>
                             </MenuFlyoutItem>
-                            <MenuFlyoutItem x:Name="cycleCondition" Text="Cycle condition: clean/pacing/network (debug)" Click="cycleCondition_Click" AllowFocusOnInteraction="false" FocusVisualSecondaryThickness="0.5" >
-                                <MenuFlyoutItem.Icon>
-                                    <FontIcon Glyph="&#xE8AB;" />
-                                </MenuFlyoutItem.Icon>
-                            </MenuFlyoutItem>
                             <MenuFlyoutItem x:Name="recomputeWeights" Text="Recompute pacing weights (debug)" Click="recomputeWeights_Click" AllowFocusOnInteraction="false" FocusVisualSecondaryThickness="0.5" >
                                 <MenuFlyoutItem.Icon>
                                     <FontIcon Glyph="&#xE9D9;" />

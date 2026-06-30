@@ -341,13 +341,6 @@ void StreamPage::resetTraceLogs_Click(Platform::Object^ sender, Windows::UI::Xam
 	Pacer::instance().resetTraceLogs();
 }
 
-void StreamPage::cycleCondition_Click(Platform::Object^ sender, Windows::UI::Xaml::RoutedEventArgs^ e)
-{
-	// Debug: label the current scene (clean -> pacing-drops -> network-drops) for the
-	// on-device auto-tuner. Shown in the stats overlay.
-	Pacer::instance().cycleCondition();
-}
-
 void StreamPage::recomputeWeights_Click(Platform::Object^ sender, Windows::UI::Xaml::RoutedEventArgs^ e)
 {
 	// Debug: fit p1/p2/p3 from the accumulated per-condition stats and apply them live.

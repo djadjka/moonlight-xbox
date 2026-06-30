@@ -39,10 +39,9 @@ class Pacer {
 	int getAdaptiveTarget();                // current PACING_ADAPTIVE drop target (stats/overlay)
 	void loadTuningParams();                // re-read adaptive constants from LocalState (no rebuild)
 	void resetTraceLogs();                  // clear the CSV pacing trace (debug)
-	void cycleCondition();                  // debug: label current scene (clean/pacing/network)
-	int  getCondition();
 	void recomputeWeights();                // debug: fit p1/p2/p3 from per-condition stats + apply
-	// Scene label for the auto-tuner (cycled from the quick menu, written to the CSV).
+	// Scene class for the auto-tuner. Auto-detected from the loss breakdown (Stats), not
+	// labelled by hand: network loss vs decoder can't-keep-up vs clean.
 	enum Condition { COND_CLEAN = 0, COND_PACING = 1, COND_NETWORK = 2, COND_COUNT = 3 };
 	// Current-condition objective readout for the overlay. score = stutter/1k + 10*(avgTarget-1).
 	struct TuneView { int cond; double avgTarget; double stutterPer1k; double score; double p1, p2, p3; };
@@ -110,11 +109,11 @@ class Pacer {
 	std::atomic<int>    m_pStarveShrinkHoldFrames{120};  // presents of lower demand before stepping down
 
 	// --- On-device auto-tuner (debug) -----------------------------------------------
-	// Per-condition running stats (render-thread EWMA, ~8 s memory). m_Condition labels
-	// the current scene so the overlay readout and recomputeWeights() can fit p1/p2/p3
-	// on-device. Plain doubles: 8-byte aligned reads are atomic on x64, races are benign
-	// for this heuristic/debug tooling.
-	std::atomic<int> m_Condition{COND_CLEAN};
+	// Per-condition running stats (render-thread EWMA, ~8 s memory), bucketed by the scene
+	// class auto-detected from the loss breakdown (detectedCondition()), so the overlay
+	// readout and recomputeWeights() can fit p1/p2/p3 on-device with no manual labelling.
+	// Plain doubles: 8-byte aligned reads are atomic on x64, races are benign here.
+	int detectedCondition();          // current auto-classified scene (from Stats)
 	double m_CondTarget[COND_COUNT]   = {1.0, 1.0, 1.0}; // EWMA committed target
 	double m_CondStarve[COND_COUNT]   = {0.0, 0.0, 0.0}; // EWMA render-starve rate (residual judder)
 	double m_CondPressure[COND_COUNT] = {0.0, 0.0, 0.0}; // EWMA loss pressure

@@ -267,6 +267,16 @@ void Stats::logCsvLine(VIDEO_STATS& s, double now) {
 	                     ? (double) s.missedDeadlines * 100.0 / (s.hitDeadlines + s.missedDeadlines)
 	                     : 0.0;
 
+	// Auto-classify the scene for the pacing tuner from the loss breakdown: network loss
+	// (packets lost in transit) vs decoder can't-keep-up (received but not decoded in time).
+	double decDrop = (s.receivedFps > 1.0) ? (s.receivedFps - s.decodedFps) / s.receivedFps * 100.0 : 0.0;
+	if (decDrop < 0.0) decDrop = 0.0;
+	int detected = Pacer::COND_CLEAN;
+	if (net_drop >= 0.3 || decDrop >= 0.3) {
+		detected = (net_drop >= decDrop) ? Pacer::COND_NETWORK : Pacer::COND_PACING;
+	}
+	m_detectedCondition.store(detected, std::memory_order_relaxed);
+
 	char buf[400];
 	int n = snprintf(buf, sizeof(buf),
 	                 "%.1f,%s,%.2f,%.2f,%.2f,%.2f,%.3f,%.3f,%.3f,%.3f,%.3f,%u,%u,%.1f,%.3f,%.3f,%.3f,%.2f,%d,%d\n",
@@ -274,7 +284,7 @@ void Stats::logCsvLine(VIDEO_STATS& s, double now) {
 	                 m_avgQueueSize, q_ms, render_ms, present_ms, decode_ms,
 	                 net_drop, s.pacerDroppedFrames, s.lastRtt, m_bwTracker.GetAverageMbps(),
 	                 ft_mean, ft_sd, s.maxFrametimeMs, missed,
-	                 Pacer::instance().getAdaptiveTarget(), Pacer::instance().getCondition());
+	                 Pacer::instance().getAdaptiveTarget(), m_detectedCondition.load(std::memory_order_relaxed));
 	if (n > 0) {
 		m_csvBuffer.append(buf, n); // pure in-memory append, no syscall on the render thread
 	}
@@ -321,6 +331,10 @@ void Stats::resetCsv() {
 	} catch (...) {
 		// best effort
 	}
+}
+
+int Stats::getDetectedCondition() {
+	return m_detectedCondition.load(std::memory_order_relaxed);
 }
 
 void Stats::formatVideoStats(DX::StepTimer const& timer, VIDEO_STATS& stats, char* output, size_t length) {

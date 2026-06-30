@@ -208,20 +208,21 @@ void Pacer::resetTraceLogs() {
 	}
 }
 
-void Pacer::cycleCondition() {
-	int c = (m_Condition.load(std::memory_order_relaxed) + 1) % COND_COUNT;
-	m_Condition.store(c, std::memory_order_relaxed);
-	const char *name = c == COND_CLEAN ? "clean" : c == COND_PACING ? "pacing-drops" : "network-drops";
-	Utils::Logf("Pacer condition -> %s\n", name);
-}
-
-int Pacer::getCondition() {
-	return m_Condition.load(std::memory_order_relaxed);
+// Current scene class, auto-detected by Stats from the per-second loss breakdown. Render
+// thread reads it each present to bucket the auto-tuner stats -- no manual labelling.
+int Pacer::detectedCondition() {
+	if (m_DeviceResources && m_DeviceResources->GetStats()) {
+		int c = m_DeviceResources->GetStats()->getDetectedCondition();
+		if (c >= 0 && c < COND_COUNT) {
+			return c;
+		}
+	}
+	return COND_CLEAN;
 }
 
 Pacer::TuneView Pacer::getTuneView() {
 	TuneView v;
-	int c = m_Condition.load(std::memory_order_relaxed);
+	int c = detectedCondition();
 	v.cond = c;
 	v.avgTarget = m_CondTarget[c];
 	v.stutterPer1k = m_CondStarve[c] * 1000.0;
@@ -517,7 +518,7 @@ bool Pacer::renderModeImmediate(std::shared_ptr<VideoRenderer> &sceneRenderer) {
 
 				// Auto-tuner accumulator: per-condition EWMA of target/pressure, and decay
 				// of the starve rate (a starve this present is added at the dequeue site).
-				const int cond = m_Condition.load(std::memory_order_relaxed);
+				const int cond = detectedCondition();
 				const double a = 0.001; // ~8 s memory @120fps
 				m_CondStarve[cond]   *= (1.0 - a);
 				m_CondTarget[cond]    = m_CondTarget[cond] * (1.0 - a) + m_AdaptiveTarget * a;
@@ -539,7 +540,7 @@ bool Pacer::renderModeImmediate(std::shared_ptr<VideoRenderer> &sceneRenderer) {
 			// target. Measurement only -- it does NOT feed the controller (that would
 			// re-introduce oscillation); it just records how well this depth is working.
 			if (mode == PACING_ADAPTIVE) {
-				m_CondStarve[m_Condition.load(std::memory_order_relaxed)] += 0.001;
+				m_CondStarve[detectedCondition()] += 0.001;
 			}
 			return false; // no frame, don't Present()
 		}

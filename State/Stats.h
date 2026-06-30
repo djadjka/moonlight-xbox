@@ -1,6 +1,7 @@
 #pragma once
 
 #include "pch.h"
+#include <atomic>
 #include <cmath>
 #include <fstream>
 #include <mutex>
@@ -74,6 +75,7 @@ namespace moonlight_xbox_dx
 		void SubmitRenderStats(double preWaitTimeMs, double renderTimeMs, double presentTimeMs, bool hitDeadline);
 		void SubmitFrametime(double frametimeMs);  // on-screen interval between new frames (judder)
 		void resetCsv();                            // clear the in-memory + on-disk pacing trace (debug)
+		int  getDetectedCondition();                // auto-classified scene: clean/pacing/network
 
 	private:
 		void addVideoStats(DX::StepTimer const& timer, VIDEO_STATS& src, VIDEO_STATS& dst);
@@ -84,6 +86,7 @@ namespace moonlight_xbox_dx
 		std::mutex                           m_mutex;
 		std::string                          m_csvBuffer;        // in-memory CSV; flushed on disconnect
 		bool                                 m_csvHeaderWritten = false;
+		std::atomic<int>                     m_detectedCondition{0};  // auto-classified scene (Pacer::Condition)
 
 		// Moonlight stats overlay
 		VIDEO_STATS                          m_ActiveWndVideoStats;
