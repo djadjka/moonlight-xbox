@@ -1,6 +1,7 @@
 #pragma once
 
 #include "pch.h"
+#include <cmath>
 #include <fstream>
 #include <mutex>
 #include <string>
@@ -46,6 +47,11 @@ typedef struct _VIDEO_STATS {
 	double receivedFps;
 	double decodedFps;
 	double renderedFps;
+	// On-screen frametime (interval between consecutive NEW frames) for judder analysis
+	uint32_t frametimeCount;
+	double totalFrametimeMs;
+	double totalFrametimeMsSq;
+	double maxFrametimeMs;
 	double measurementStartTimestamp;
 } VIDEO_STATS, *PVIDEO_STATS;
 
@@ -66,6 +72,7 @@ namespace moonlight_xbox_dx
 		void SubmitPacerTime(int64_t pacerTimeQpc);
 		void SubmitPresentPacing(double presentDisplayMs);
 		void SubmitRenderStats(double preWaitTimeMs, double renderTimeMs, double presentTimeMs, bool hitDeadline);
+		void SubmitFrametime(double frametimeMs);  // on-screen interval between new frames (judder)
 
 	private:
 		void addVideoStats(DX::StepTimer const& timer, VIDEO_STATS& src, VIDEO_STATS& dst);

@@ -285,6 +285,7 @@ void moonlight_xbox_dxMain::StartRenderLoop() {
 						hostFrametimeMs = ((double)currentFramePts - lastFramePts) / 90.0;
 						frametimeMs = QpcToMs(t3 - lastPresentTime);
 						ImGuiPlots::instance().observeFloat(PLOT_FRAMETIME, static_cast<float>(frametimeMs));
+						m_deviceResources->GetStats()->SubmitFrametime(frametimeMs);
 					}
 					lastPresentTime = t3;
 					lastFramePts = currentFramePts;

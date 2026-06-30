@@ -162,6 +162,18 @@ void Stats::SubmitRenderStats(double preWaitTimeMs, double renderTimeMs, double 
 	m_ActiveWndVideoStats.totalPresentTimeUs += static_cast<uint64_t>(presentTimeMs * 1000);
 }
 
+// On-screen interval between consecutive NEW frames; accumulate sum + sum-of-squares so
+// logCsvLine can emit mean/stddev (= judder) and max per window.
+void Stats::SubmitFrametime(double frametimeMs) {
+	std::lock_guard<std::mutex> lock(m_mutex);
+	m_ActiveWndVideoStats.frametimeCount++;
+	m_ActiveWndVideoStats.totalFrametimeMs += frametimeMs;
+	m_ActiveWndVideoStats.totalFrametimeMsSq += frametimeMs * frametimeMs;
+	if (frametimeMs > m_ActiveWndVideoStats.maxFrametimeMs) {
+		m_ActiveWndVideoStats.maxFrametimeMs = frametimeMs;
+	}
+}
+
 /// private methods
 
 void Stats::addVideoStats(DX::StepTimer const& timer, VIDEO_STATS& src, VIDEO_STATS& dst) {
@@ -173,6 +185,10 @@ void Stats::addVideoStats(DX::StepTimer const& timer, VIDEO_STATS& src, VIDEO_ST
 	dst.pacerDroppedFrames += src.pacerDroppedFrames;
 	dst.hitDeadlines += src.hitDeadlines;
 	dst.missedDeadlines += src.missedDeadlines;
+	dst.frametimeCount += src.frametimeCount;
+	dst.totalFrametimeMs += src.totalFrametimeMs;
+	dst.totalFrametimeMsSq += src.totalFrametimeMsSq;
+	dst.maxFrametimeMs = std::max(dst.maxFrametimeMs, src.maxFrametimeMs);
 	dst.totalReassemblyTimeUs += src.totalReassemblyTimeUs;
 	dst.totalDecodeTime += src.totalDecodeTime;
 	dst.totalPacerTimeUs += src.totalPacerTimeUs;
@@ -224,7 +240,7 @@ void Stats::logCsvLine(VIDEO_STATS& s, double now) {
 	if (!m_csvHeaderWritten) {
 		m_csvBuffer.reserve(256 * 1024); // avoid reallocations during a normal session
 		m_csvBuffer += "# --- session start ---\n"
-		               "t_s,mode,recv_fps,dec_fps,rend_fps,frames_in_q,q_ms,render_ms,present_ms,decode_ms,net_drop_pct,pacer_drops,rtt_ms,bitrate_mbps\n";
+		               "t_s,mode,recv_fps,dec_fps,rend_fps,frames_in_q,q_ms,render_ms,present_ms,decode_ms,net_drop_pct,pacer_drops,rtt_ms,bitrate_mbps,ft_mean_ms,ft_sd_ms,ft_max_ms,missed_pct\n";
 		m_csvHeaderWritten = true;
 	}
 
@@ -243,12 +259,21 @@ void Stats::logCsvLine(VIDEO_STATS& s, double now) {
 	double decode_ms  = s.decodedFrames ? s.totalDecodeTime / s.decodedFrames : 0.0;
 	double net_drop   = s.totalFrames ? (double) s.networkDroppedFrames * 100.0 / s.totalFrames : 0.0;
 
-	char buf[320];
+	// Frametime stats (judder): mean/stddev of the on-screen interval between new frames.
+	double ft_mean = s.frametimeCount ? s.totalFrametimeMs / s.frametimeCount : 0.0;
+	double ft_var  = s.frametimeCount ? (s.totalFrametimeMsSq / s.frametimeCount) - (ft_mean * ft_mean) : 0.0;
+	double ft_sd   = ft_var > 0.0 ? sqrt(ft_var) : 0.0;
+	double missed  = (s.hitDeadlines + s.missedDeadlines)
+	                     ? (double) s.missedDeadlines * 100.0 / (s.hitDeadlines + s.missedDeadlines)
+	                     : 0.0;
+
+	char buf[400];
 	int n = snprintf(buf, sizeof(buf),
-	                 "%.1f,%s,%.2f,%.2f,%.2f,%.2f,%.3f,%.3f,%.3f,%.3f,%.3f,%u,%u,%.1f\n",
+	                 "%.1f,%s,%.2f,%.2f,%.2f,%.2f,%.3f,%.3f,%.3f,%.3f,%.3f,%u,%u,%.1f,%.3f,%.3f,%.3f,%.2f\n",
 	                 now, mode, s.receivedFps, s.decodedFps, s.renderedFps,
 	                 m_avgQueueSize, q_ms, render_ms, present_ms, decode_ms,
-	                 net_drop, s.pacerDroppedFrames, s.lastRtt, m_bwTracker.GetAverageMbps());
+	                 net_drop, s.pacerDroppedFrames, s.lastRtt, m_bwTracker.GetAverageMbps(),
+	                 ft_mean, ft_sd, s.maxFrametimeMs, missed);
 	if (n > 0) {
 		m_csvBuffer.append(buf, n); // pure in-memory append, no syscall on the render thread
 	}
