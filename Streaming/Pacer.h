@@ -37,6 +37,7 @@ class Pacer {
 	int getPacingMode();
 	void setPacingMode(int mode);
 	int getAdaptiveTarget();                // current PACING_ADAPTIVE drop target (stats/overlay)
+	double getRecentLossPressure();         // decaying producer-side loss count (tuner's clean/loss signal)
 	void loadTuningParams();                // re-read adaptive constants from LocalState (no rebuild)
 	void resetTraceLogs();                  // clear the CSV pacing trace (debug)
 	void recomputeWeights();                // debug: fit p1/p2/p3 from per-condition stats + apply

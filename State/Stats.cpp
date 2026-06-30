@@ -267,13 +267,19 @@ void Stats::logCsvLine(VIDEO_STATS& s, double now) {
 	                     ? (double) s.missedDeadlines * 100.0 / (s.hitDeadlines + s.missedDeadlines)
 	                     : 0.0;
 
-	// Auto-classify the scene for the pacing tuner from the loss breakdown: network loss
-	// (packets lost in transit) vs decoder can't-keep-up (received but not decoded in time).
+	// Auto-classify the scene for the pacing tuner. "Clean" is decided by the SAME producer-
+	// side loss signal the adaptive controller reacts to (so the label can't say clean while
+	// the tuner sees loss); the network-vs-decoder split then uses the per-second loss
+	// breakdown -- network loss (packets lost in transit) vs decoder can't-keep-up (received
+	// but not decoded in time). A loss the fps breakdown doesn't attribute falls to decoder.
 	double decDrop = (s.receivedFps > 1.0) ? (s.receivedFps - s.decodedFps) / s.receivedFps * 100.0 : 0.0;
 	if (decDrop < 0.0) decDrop = 0.0;
+	double lossPressure = Pacer::instance().getRecentLossPressure();
 	int detected = Pacer::COND_CLEAN;
 	if (net_drop >= 0.3 || decDrop >= 0.3) {
 		detected = (net_drop >= decDrop) ? Pacer::COND_NETWORK : Pacer::COND_PACING;
+	} else if (lossPressure >= 0.5) {
+		detected = Pacer::COND_PACING; // tuner sees loss the fps breakdown missed -> decoder/pacing
 	}
 	m_detectedCondition.store(detected, std::memory_order_relaxed);
 

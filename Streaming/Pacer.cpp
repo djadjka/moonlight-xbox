@@ -169,6 +169,14 @@ int Pacer::getAdaptiveTarget() {
 	return m_AdaptiveTargetPublished.load(std::memory_order_acquire);
 }
 
+// The decaying producer-side loss count the adaptive controller reacts to. Stats reads it to
+// classify the scene from the SAME signal the tuner uses, so the label can't disagree with
+// the buffer's behaviour (~0 in a clean scene, elevated under sustained loss). Updated on the
+// render thread; Stats::logCsvLine reads it on that same thread, so the read is race-free.
+double Pacer::getRecentLossPressure() {
+	return m_StarvePressure;
+}
+
 // Re-read the PACING_ADAPTIVE controller constants from LocalState\pacing_params.txt so
 // they can be tuned on-device without a rebuild. Format: one "key=value" per line, keys
 // forget / p1 / p2 / p3 / shrink_hold. Missing file or keys keep the current values.
