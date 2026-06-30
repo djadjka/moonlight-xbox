@@ -310,10 +310,9 @@ bool Pacer::renderModeImmediate(std::shared_ptr<VideoRenderer> &sceneRenderer) {
 					// deviation, so scale by ~2 to approximate a ~95th-percentile buffer.
 					const double SAFETY = 2.0;
 					const double ratio = (jitterMs * SAFETY) / frameMs; // jitter (tail) in frames
-					int extra = static_cast<int>(ratio);
-					if (static_cast<double>(extra) < ratio) { // ceil for positive ratio
-						extra++;
-					}
+					// Round (not ceil): trivial jitter -> 0 extra -> target 1 (= drain),
+					// so we only buffer once the tail exceeds ~half a frame.
+					int extra = static_cast<int>(ratio + 0.5);
 					target = 1 + extra;
 					if (target > 4) { // cap (FrameQueue holds ~5)
 						target = 4;
