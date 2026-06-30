@@ -240,7 +240,7 @@ void Stats::logCsvLine(VIDEO_STATS& s, double now) {
 	if (!m_csvHeaderWritten) {
 		m_csvBuffer.reserve(256 * 1024); // avoid reallocations during a normal session
 		m_csvBuffer += "# --- session start ---\n"
-		               "t_s,mode,recv_fps,dec_fps,rend_fps,frames_in_q,q_ms,render_ms,present_ms,decode_ms,net_drop_pct,pacer_drops,rtt_ms,bitrate_mbps,ft_mean_ms,ft_sd_ms,ft_max_ms,missed_pct\n";
+		               "t_s,mode,recv_fps,dec_fps,rend_fps,frames_in_q,q_ms,render_ms,present_ms,decode_ms,net_drop_pct,pacer_drops,rtt_ms,bitrate_mbps,ft_mean_ms,ft_sd_ms,ft_max_ms,missed_pct,adaptive_target\n";
 		m_csvHeaderWritten = true;
 	}
 
@@ -269,11 +269,11 @@ void Stats::logCsvLine(VIDEO_STATS& s, double now) {
 
 	char buf[400];
 	int n = snprintf(buf, sizeof(buf),
-	                 "%.1f,%s,%.2f,%.2f,%.2f,%.2f,%.3f,%.3f,%.3f,%.3f,%.3f,%u,%u,%.1f,%.3f,%.3f,%.3f,%.2f\n",
+	                 "%.1f,%s,%.2f,%.2f,%.2f,%.2f,%.3f,%.3f,%.3f,%.3f,%.3f,%u,%u,%.1f,%.3f,%.3f,%.3f,%.2f,%d\n",
 	                 now, mode, s.receivedFps, s.decodedFps, s.renderedFps,
 	                 m_avgQueueSize, q_ms, render_ms, present_ms, decode_ms,
 	                 net_drop, s.pacerDroppedFrames, s.lastRtt, m_bwTracker.GetAverageMbps(),
-	                 ft_mean, ft_sd, s.maxFrametimeMs, missed);
+	                 ft_mean, ft_sd, s.maxFrametimeMs, missed, Pacer::instance().getAdaptiveTarget());
 	if (n > 0) {
 		m_csvBuffer.append(buf, n); // pure in-memory append, no syscall on the render thread
 	}

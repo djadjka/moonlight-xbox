@@ -36,6 +36,7 @@ class Pacer {
 	void setPacingImmediate(bool framePacingImmediate);  // DRAIN <-> DISPLAY_LOCKED (config init + #253 toggle)
 	int getPacingMode();
 	void setPacingMode(int mode);
+	int getAdaptiveTarget();                // current PACING_ADAPTIVE drop target (stats/overlay)
 	void waitForFrame(double timeoutMs);
 	bool renderOnMainThread(std::shared_ptr<moonlight_xbox_dx::VideoRenderer> &sceneRenderer);
 	bool waitBeforePresent(int64_t deadline);
@@ -76,6 +77,15 @@ class Pacer {
 	std::atomic<double> m_ArrivalJitterMs{0.0};
 	int64_t m_LastEnqueueQpc = 0;
 	bool m_HaveLastEnqueue = false;
+	// PACING_ADAPTIVE starve-driven buffer controller (render-thread only -> no atomics,
+	// except the published target read by the stats overlay/CSV). A "starve" is a present
+	// with no fresh frame (empty queue -> a repeated frame = the exact judder a buffer
+	// fixes, from any source). We grow the target fast on a decaying count of recent
+	// starves and shrink it slowly. See renderModeImmediate.
+	double m_StarvePressure = 0.0;   // decaying count of recent starves
+	int    m_AdaptiveTarget = 1;     // committed drop target (grow fast, shrink slow)
+	int    m_ShrinkHoldFrames = 0;   // presents the lower demand has held (shrink gate)
+	std::atomic<int> m_AdaptiveTargetPublished{1};  // for the stats overlay/CSV only
 
 	FrameCadence m_FrameCadence;
 	AVFrame* m_CurrentFrame = nullptr;

@@ -34,6 +34,17 @@
 constexpr int FRAME_QUEUE_LOW = 1;
 constexpr int FRAME_QUEUE_HIGH = 3;
 
+// PACING_ADAPTIVE starve-driven buffer controller (starting points; tuned on-device).
+// A "starve" (empty queue at present -> a repeated frame) is the exact judder a buffer
+// fixes, from ANY source (decoder drop, network spike, scene burst). m_StarvePressure is
+// a decaying count of recent starves; it maps to a buffer depth, grows fast and shrinks
+// slowly so the buffer engages only while judder persists and returns to 1 when clean.
+constexpr double kStarveForget = 0.997;          // per-present decay (~2.8 s memory @120fps)
+constexpr double kStarveP1 = 2.0;                // pressure -> target 2 (sustained light judder)
+constexpr double kStarveP2 = 6.0;                // pressure -> target 3
+constexpr double kStarveP3 = 12.0;               // pressure -> target 4
+constexpr int    kStarveShrinkHoldFrames = 120;  // ~1 s of lower demand before stepping down
+
 using steady_clock = std::chrono::steady_clock;
 using namespace moonlight_xbox_dx;
 
@@ -103,6 +114,12 @@ void Pacer::init(const std::shared_ptr<DX::DeviceResources> &res, int streamFps,
 	m_LastSyncTarget = 0;
 	m_ewmaVsyncDriftQpc = MsToQpc(0.0001);
 
+	// Reset the PACING_ADAPTIVE controller so a reconnect starts at the low-latency floor.
+	m_StarvePressure = 0.0;
+	m_AdaptiveTarget = 1;
+	m_ShrinkHoldFrames = 0;
+	m_AdaptiveTargetPublished.store(1, std::memory_order_release);
+
 	// Start FrameQueue so it's ready to receive new frames
 	FrameQueue::instance().setHighWaterMark(FRAME_QUEUE_HIGH);
 	FrameQueue::instance().start();
@@ -133,6 +150,10 @@ void Pacer::setPacingMode(int mode) {
 		mode = PACING_DRAIN;
 	}
 	m_PacingMode.store(mode, std::memory_order_release);
+}
+
+int Pacer::getAdaptiveTarget() {
+	return m_AdaptiveTargetPublished.load(std::memory_order_acquire);
 }
 
 void Pacer::vsyncHardware() {
@@ -317,23 +338,48 @@ bool Pacer::renderModeImmediate(std::shared_ptr<VideoRenderer> &sceneRenderer) {
 				}
 				m_QueueDepthHistory.push_back(depth);
 			} else {
-				// PACING_ADAPTIVE: size the buffer to the measured arrival jitter
-				// (adaptive-playout style). frameMs is the host frame period.
+				// PACING_ADAPTIVE: size the buffer to recent judder from ANY source
+				// (decoder drops, network spikes, scene bursts) via a decaying starve
+				// controller. Grow fast, shrink slow, so the buffer engages only while
+				// judder persists and returns to 1 (== DRAIN latency) when the link is
+				// clean. The starve itself is recorded at the empty-queue site below.
+				m_StarvePressure *= kStarveForget;
+
+				// Reactive term: map the decaying starve rate to a buffer depth.
+				int desired = 1;
+				if (m_StarvePressure >= kStarveP1) desired = 2;
+				if (m_StarvePressure >= kStarveP2) desired = 3;
+				if (m_StarvePressure >= kStarveP3) desired = 4;
+
+				// Predictive floor: pre-buffer sustained network arrival jitter (RFC 3550
+				// tail) before it turns into starves.
 				const double frameMs = m_FrameCadence.streamPeriodMs();
-				const double jitterMs = m_ArrivalJitterMs.load(std::memory_order_acquire);
 				if (frameMs > 0.0) {
-					// Cover the jitter TAIL, not just the mean: RFC 3550 J is a mean
-					// deviation, so scale by ~2 to approximate a ~95th-percentile buffer.
-					const double SAFETY = 2.0;
-					const double ratio = (jitterMs * SAFETY) / frameMs; // jitter (tail) in frames
-					// Round (not ceil): trivial jitter -> 0 extra -> target 1 (= drain),
-					// so we only buffer once the tail exceeds ~half a frame.
-					int extra = static_cast<int>(ratio + 0.5);
-					target = 1 + extra;
-					if (target > 4) { // cap (FrameQueue holds ~5)
-						target = 4;
+					const double jitterMs = m_ArrivalJitterMs.load(std::memory_order_acquire);
+					int floorTarget = 1 + static_cast<int>(((jitterMs * 2.0) / frameMs) + 0.5);
+					if (floorTarget > desired) {
+						desired = floorTarget;
 					}
 				}
+				if (desired > 4) { // cap (FrameQueue holds ~5)
+					desired = 4;
+				}
+
+				// Grow fast, shrink slow: jump up immediately; step down one only after the
+				// lower demand has held for kStarveShrinkHoldFrames (anti-oscillation).
+				if (desired > m_AdaptiveTarget) {
+					m_AdaptiveTarget = desired;
+					m_ShrinkHoldFrames = 0;
+				} else if (desired < m_AdaptiveTarget) {
+					if (++m_ShrinkHoldFrames >= kStarveShrinkHoldFrames) {
+						--m_AdaptiveTarget;
+						m_ShrinkHoldFrames = 0;
+					}
+				} else {
+					m_ShrinkHoldFrames = 0;
+				}
+				target = m_AdaptiveTarget;
+				m_AdaptiveTargetPublished.store(target, std::memory_order_release);
 			}
 		}
 		// Drop the OLDEST frames until we are at the target depth.
@@ -347,6 +393,12 @@ bool Pacer::renderModeImmediate(std::shared_ptr<VideoRenderer> &sceneRenderer) {
 		}
 		newFrame = FrameQueue::instance().dequeue();
 		if (!newFrame) {
+			// Starve: no fresh frame this present (-> a repeated frame). Feed the
+			// PACING_ADAPTIVE controller so the buffer grows. Gated like the target, so
+			// expected alternate-present gaps (source slower than display) don't count.
+			if (mode == PACING_ADAPTIVE && m_StreamFps >= m_RefreshRate) {
+				m_StarvePressure += 1.0;
+			}
 			return false; // no frame, don't Present()
 		}
 	}
