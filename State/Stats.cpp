@@ -240,7 +240,7 @@ void Stats::logCsvLine(VIDEO_STATS& s, double now) {
 	if (!m_csvHeaderWritten) {
 		m_csvBuffer.reserve(256 * 1024); // avoid reallocations during a normal session
 		m_csvBuffer += "# --- session start ---\n"
-		               "t_s,mode,recv_fps,dec_fps,rend_fps,frames_in_q,q_ms,render_ms,present_ms,decode_ms,net_drop_pct,pacer_drops,rtt_ms,bitrate_mbps,ft_mean_ms,ft_sd_ms,ft_max_ms,missed_pct,adaptive_target\n";
+		               "t_s,mode,recv_fps,dec_fps,rend_fps,frames_in_q,q_ms,render_ms,present_ms,decode_ms,net_drop_pct,pacer_drops,rtt_ms,bitrate_mbps,ft_mean_ms,ft_sd_ms,ft_max_ms,missed_pct,adaptive_target,condition\n";
 		m_csvHeaderWritten = true;
 	}
 
@@ -269,11 +269,12 @@ void Stats::logCsvLine(VIDEO_STATS& s, double now) {
 
 	char buf[400];
 	int n = snprintf(buf, sizeof(buf),
-	                 "%.1f,%s,%.2f,%.2f,%.2f,%.2f,%.3f,%.3f,%.3f,%.3f,%.3f,%u,%u,%.1f,%.3f,%.3f,%.3f,%.2f,%d\n",
+	                 "%.1f,%s,%.2f,%.2f,%.2f,%.2f,%.3f,%.3f,%.3f,%.3f,%.3f,%u,%u,%.1f,%.3f,%.3f,%.3f,%.2f,%d,%d\n",
 	                 now, mode, s.receivedFps, s.decodedFps, s.renderedFps,
 	                 m_avgQueueSize, q_ms, render_ms, present_ms, decode_ms,
 	                 net_drop, s.pacerDroppedFrames, s.lastRtt, m_bwTracker.GetAverageMbps(),
-	                 ft_mean, ft_sd, s.maxFrametimeMs, missed, Pacer::instance().getAdaptiveTarget());
+	                 ft_mean, ft_sd, s.maxFrametimeMs, missed,
+	                 Pacer::instance().getAdaptiveTarget(), Pacer::instance().getCondition());
 	if (n > 0) {
 		m_csvBuffer.append(buf, n); // pure in-memory append, no syscall on the render thread
 	}
@@ -445,6 +446,19 @@ void Stats::formatVideoStats(DX::StepTimer const& timer, VIDEO_STATS& stats, cha
 		}
 
 		offset += ret;
+
+		// Auto-tuner readout (debug): the objective the adaptive weights minimise + the weights.
+		if (Pacer::instance().getPacingMode() == Pacer::PACING_ADAPTIVE) {
+			Pacer::TuneView tv = Pacer::instance().getTuneView();
+			const char *condName = tv.cond == Pacer::COND_CLEAN ? "clean"
+			                     : tv.cond == Pacer::COND_PACING ? "pacing-drops" : "network-drops";
+			ret = snprintf(&output[offset], length - offset,
+			               "Pacing tune [%s]: tgt %.2f  stutter %.1f/1k  score %.1f  | p %.1f/%.1f/%.1f\n",
+			               condName, tv.avgTarget, tv.stutterPer1k, tv.score, tv.p1, tv.p2, tv.p3);
+			if (ret > 0 && (size_t)ret < (length - offset)) {
+				offset += ret;
+			}
+		}
 	}
 
 	if (stats.framesWithHostProcessingLatency > 0) {

@@ -208,6 +208,84 @@ void Pacer::resetTraceLogs() {
 	}
 }
 
+void Pacer::cycleCondition() {
+	int c = (m_Condition.load(std::memory_order_relaxed) + 1) % COND_COUNT;
+	m_Condition.store(c, std::memory_order_relaxed);
+	const char *name = c == COND_CLEAN ? "clean" : c == COND_PACING ? "pacing-drops" : "network-drops";
+	Utils::Logf("Pacer condition -> %s\n", name);
+}
+
+int Pacer::getCondition() {
+	return m_Condition.load(std::memory_order_relaxed);
+}
+
+Pacer::TuneView Pacer::getTuneView() {
+	TuneView v;
+	int c = m_Condition.load(std::memory_order_relaxed);
+	v.cond = c;
+	v.avgTarget = m_CondTarget[c];
+	v.stutterPer1k = m_CondStarve[c] * 1000.0;
+	v.p1 = m_pStarveP1.load(std::memory_order_relaxed);
+	v.p2 = m_pStarveP2.load(std::memory_order_relaxed);
+	v.p3 = m_pStarveP3.load(std::memory_order_relaxed);
+	v.score = v.stutterPer1k + 10.0 * (v.avgTarget - 1.0);
+	return v;
+}
+
+// Fit p1/p2/p3 from the per-condition stats and apply them live + persist. For each
+// labelled condition, the smallest buffer target that holds the residual starve rate
+// under threshold is the target that condition needs; the thresholds are then placed
+// just below the loss pressure at which each higher target became necessary.
+void Pacer::recomputeWeights() {
+	const double kStutterThresh1k = 5.0; // starves/1k above which a depth is under-buffered
+	int needed[COND_COUNT];
+	for (int c = 0; c < COND_COUNT; ++c) {
+		int t = static_cast<int>(m_CondTarget[c] + 0.5);
+		if (t < 1) t = 1;
+		if (m_CondStarve[c] * 1000.0 > kStutterThresh1k && t < 4) {
+			t += 1; // still juddering at this depth -> needs one more
+		}
+		needed[c] = t;
+	}
+	double newP[3] = {1e9, 1e9, 1e9}; // p1,p2,p3; 1e9 = that depth is never reached
+	for (int level = 2; level <= 4; ++level) {
+		double minP = 1e9;
+		for (int c = 0; c < COND_COUNT; ++c) {
+			if (needed[c] >= level && m_CondPressure[c] < minP) {
+				minP = m_CondPressure[c];
+			}
+		}
+		if (minP < 1e9) {
+			newP[level - 2] = minP * 0.9; // sit just below the observed pressure
+		}
+	}
+	if (newP[1] < newP[0]) newP[1] = newP[0]; // keep thresholds monotonic
+	if (newP[2] < newP[1]) newP[2] = newP[1];
+	m_pStarveP1.store(newP[0], std::memory_order_relaxed);
+	m_pStarveP2.store(newP[1], std::memory_order_relaxed);
+	m_pStarveP3.store(newP[2], std::memory_order_relaxed);
+
+	// Persist so the fit survives a reconnect and is visible/editable in pacing_params.txt.
+	try {
+		auto folder = Windows::Storage::ApplicationData::Current->LocalFolder;
+		std::wstring path(folder->Path->Data());
+		path += L"\\pacing_params.txt";
+		std::ofstream f(path.c_str(), std::ios::trunc);
+		if (f.is_open()) {
+			f << "# recomputed on-device\n";
+			f << "forget=" << m_pStarveForget.load() << "\n";
+			f << "p1=" << newP[0] << "\n";
+			f << "p2=" << newP[1] << "\n";
+			f << "p3=" << newP[2] << "\n";
+			f << "shrink_hold=" << m_pStarveShrinkHoldFrames.load() << "\n";
+		}
+	} catch (...) {
+		// best effort
+	}
+	Utils::Logf("Pacer recompute: needed[clean=%d pacing=%d net=%d] -> p1=%.2f p2=%.2f p3=%.2f\n",
+	            needed[COND_CLEAN], needed[COND_PACING], needed[COND_NETWORK], newP[0], newP[1], newP[2]);
+}
+
 void Pacer::vsyncHardware() {
 	if (!SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_ABOVE_NORMAL)) {
 		Utils::Logf("Failed to set vsyncHardware priority: %d\n", GetLastError());
@@ -436,6 +514,14 @@ bool Pacer::renderModeImmediate(std::shared_ptr<VideoRenderer> &sceneRenderer) {
 				}
 				target = m_AdaptiveTarget;
 				m_AdaptiveTargetPublished.store(target, std::memory_order_release);
+
+				// Auto-tuner accumulator: per-condition EWMA of target/pressure, and decay
+				// of the starve rate (a starve this present is added at the dequeue site).
+				const int cond = m_Condition.load(std::memory_order_relaxed);
+				const double a = 0.001; // ~8 s memory @120fps
+				m_CondStarve[cond]   *= (1.0 - a);
+				m_CondTarget[cond]    = m_CondTarget[cond] * (1.0 - a) + m_AdaptiveTarget * a;
+				m_CondPressure[cond]  = m_CondPressure[cond] * (1.0 - a) + m_StarvePressure * a;
 			}
 		}
 		// Drop the OLDEST frames until we are at the target depth.
@@ -449,6 +535,12 @@ bool Pacer::renderModeImmediate(std::shared_ptr<VideoRenderer> &sceneRenderer) {
 		}
 		newFrame = FrameQueue::instance().dequeue();
 		if (!newFrame) {
+			// Auto-tuner: a starve (repeated frame) is the residual judder at the current
+			// target. Measurement only -- it does NOT feed the controller (that would
+			// re-introduce oscillation); it just records how well this depth is working.
+			if (mode == PACING_ADAPTIVE) {
+				m_CondStarve[m_Condition.load(std::memory_order_relaxed)] += 0.001;
+			}
 			return false; // no frame, don't Present()
 		}
 	}

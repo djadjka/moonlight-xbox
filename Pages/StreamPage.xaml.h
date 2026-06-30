@@ -159,6 +159,8 @@ namespace moonlight_xbox_dx
 		void toggleFramePacing_Click(Platform::Object^ sender, Windows::UI::Xaml::RoutedEventArgs^ e);
 		void cyclePacingMode_Click(Platform::Object^ sender, Windows::UI::Xaml::RoutedEventArgs^ e);
 		void resetTraceLogs_Click(Platform::Object^ sender, Windows::UI::Xaml::RoutedEventArgs^ e);
+		void cycleCondition_Click(Platform::Object^ sender, Windows::UI::Xaml::RoutedEventArgs^ e);
+		void recomputeWeights_Click(Platform::Object^ sender, Windows::UI::Xaml::RoutedEventArgs^ e);
 
 		Windows::Foundation::EventRegistrationToken gamepadAddedHandler, gamepadRemovedHandler;
 		std::atomic<bool> m_refreshGamepads{false};
