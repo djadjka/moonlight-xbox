@@ -62,7 +62,7 @@
                                     <FontIcon Glyph="&#xE8B9;" />
                                 </MenuFlyoutItem.Icon>
                             </MenuFlyoutItem>
-                            <MenuFlyoutItem x:Name="cycleImmediatePacing" Text="Cycle Immediate pacing (debug)" Click="cycleImmediatePacing_Click" AllowFocusOnInteraction="false" FocusVisualSecondaryThickness="0.5" >
+                            <MenuFlyoutItem x:Name="cyclePacingMode" Text="Cycle pacing mode (debug)" Click="cyclePacingMode_Click" AllowFocusOnInteraction="false" FocusVisualSecondaryThickness="0.5" >
                                 <MenuFlyoutItem.Icon>
                                     <FontIcon Glyph="&#xE74D;" />
                                 </MenuFlyoutItem.Icon>

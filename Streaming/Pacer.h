@@ -18,19 +18,23 @@ class Pacer {
 	// Singleton accessor
 	static Pacer &instance();
 
-	// Immediate-mode catch-up strategy (debug-selectable from the quick menu).
-	enum ImmediatePacingMode {
-		PACING_LEGACY = 0,  // original single-shot catch-up (off-by-one standing buffer)
-		PACING_DRAIN = 1,   // drain to the newest frame every present (lowest latency)
-		PACING_QT = 2,      // moonlight-qt hysteresis: drop to floor only on a persistent backlog
+	// Frame pacing strategy (selectable from the quick menu). DISPLAY_LOCKED routes
+	// through renderModeDisplayLocked; the rest are renderModeImmediate variants that
+	// differ only in their drop policy.
+	enum PacingMode {
+		PACING_DISPLAY_LOCKED = 0,  // present every vblank, cadence-managed repetition (smoother, +1 frame)
+		PACING_DRAIN = 1,           // immediate: render newest, drop older every present (lowest latency)
+		PACING_QT = 2,              // immediate: moonlight-qt hysteresis (drop only on a persistent backlog)
+		PACING_ADAPTIVE = 3,        // immediate: buffer target sized to measured arrival jitter
+		PACING_MODE_COUNT = 4,      // for cycling
 	};
 
 	void deinit();
 	void init(const std::shared_ptr<DX::DeviceResources> &res, int maxVideoFps, double refreshRate, bool framePacingImmediate);
-	bool getPacingImmediate();
-	void setPacingImmediate(bool framePacingImmediate);
-	int getImmediatePacing();
-	void setImmediatePacing(int mode);
+	bool getPacingImmediate();              // = (mode != DISPLAY_LOCKED); kept for stats/compat
+	void setPacingImmediate(bool framePacingImmediate);  // DRAIN <-> DISPLAY_LOCKED (config init + #253 toggle)
+	int getPacingMode();
+	void setPacingMode(int mode);
 	void waitForFrame(double timeoutMs);
 	bool renderOnMainThread(std::shared_ptr<moonlight_xbox_dx::VideoRenderer> &sceneRenderer);
 	bool waitBeforePresent(int64_t deadline);
@@ -62,11 +66,15 @@ class Pacer {
 	std::atomic<bool> m_Stopping{false};
 	int m_StreamFps;
 	double m_RefreshRate;
-	std::atomic<bool> m_FramePacingImmediate;
-	std::atomic<int> m_ImmediatePacing{PACING_DRAIN};
+	std::atomic<int> m_PacingMode{PACING_DRAIN};
 	// Rolling history of pre-dequeue queue depth, used by PACING_QT to drop only
 	// on a persistent backlog (touched only on the render thread).
 	std::deque<int> m_QueueDepthHistory;
+	// Smoothed frame-arrival jitter (ms), measured on the decoder thread in
+	// submitFrame and read by PACING_ADAPTIVE to size the buffer target.
+	std::atomic<double> m_ArrivalJitterMs{0.0};
+	int64_t m_LastEnqueueQpc = 0;
+	bool m_HaveLastEnqueue = false;
 
 	FrameCadence m_FrameCadence;
 	AVFrame* m_CurrentFrame = nullptr;

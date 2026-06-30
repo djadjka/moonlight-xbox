@@ -327,12 +327,12 @@ void StreamPage::toggleFramePacing_Click(Platform::Object^ sender, Windows::UI::
 	Pacer::instance().setPacingImmediate(isImmediate ? false : true);
 }
 
-void StreamPage::cycleImmediatePacing_Click(Platform::Object^ sender, Windows::UI::Xaml::RoutedEventArgs^ e)
+void StreamPage::cyclePacingMode_Click(Platform::Object^ sender, Windows::UI::Xaml::RoutedEventArgs^ e)
 {
-	// Debug A/B: cycle the Immediate catch-up strategy legacy -> drain -> qt -> ...
+	// Debug A/B: cycle the pacing strategy display-locked -> drain -> qt -> adaptive -> ...
 	// thread safe atomic int
-	int mode = Pacer::instance().getImmediatePacing();
-	Pacer::instance().setImmediatePacing((mode + 1) % 3);
+	int mode = Pacer::instance().getPacingMode();
+	Pacer::instance().setPacingMode((mode + 1) % Pacer::PACING_MODE_COUNT);
 }
 
 void StreamPage::OnPropertyChanged(Platform::String^ propertyName)

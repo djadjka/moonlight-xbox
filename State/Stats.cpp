@@ -299,13 +299,12 @@ void Stats::formatVideoStats(DX::StepTimer const& timer, VIDEO_STATS& stats, cha
 		double avgVideoMbps = m_bwTracker.GetAverageMbps();
 		double peakVideoMbps = m_bwTracker.GetPeakMbps();
 
-		const char* pacingModeStr = "display-locked";
-		if (Pacer::instance().getPacingImmediate()) {
-			switch (Pacer::instance().getImmediatePacing()) {
-				case Pacer::PACING_LEGACY: pacingModeStr = "immediate, legacy"; break;
-				case Pacer::PACING_QT:     pacingModeStr = "immediate, qt";     break;
-				default:                   pacingModeStr = "immediate, drain";  break;
-			}
+		const char* pacingModeStr;
+		switch (Pacer::instance().getPacingMode()) {
+			case Pacer::PACING_DISPLAY_LOCKED: pacingModeStr = "display-locked";      break;
+			case Pacer::PACING_QT:             pacingModeStr = "immediate, qt";       break;
+			case Pacer::PACING_ADAPTIVE:       pacingModeStr = "immediate, adaptive"; break;
+			default:                           pacingModeStr = "immediate, drain";    break;
 		}
 
 		ret = snprintf(&output[offset],

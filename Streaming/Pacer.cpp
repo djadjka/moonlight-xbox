@@ -49,7 +49,6 @@ Pacer::Pacer()
       m_Stopping(false),
       m_StreamFps(0),
       m_RefreshRate(0.0),
-      m_FramePacingImmediate(true),
       m_FrameCadence(),
       m_LastSyncRefreshCount(0),
       m_LastSyncQpc(0),
@@ -83,7 +82,13 @@ void Pacer::init(const std::shared_ptr<DX::DeviceResources> &res, int streamFps,
 	m_DeviceResources = res;
 	m_StreamFps = streamFps;
 	m_RefreshRate = refreshRate;
-	m_FramePacingImmediate.store(framePacingImmediate, std::memory_order_release);
+	// Keep the configured default mode, but don't downgrade a user-selected
+	// Immediate strategy (qt/adaptive) to plain drain on reinit.
+	if (!framePacingImmediate) {
+		m_PacingMode.store(PACING_DISPLAY_LOCKED, std::memory_order_release);
+	} else if (m_PacingMode.load(std::memory_order_acquire) == PACING_DISPLAY_LOCKED) {
+		m_PacingMode.store(PACING_DRAIN, std::memory_order_release);
+	}
 
 	m_FrameCadence.init(m_RefreshRate > 0.0 ? m_RefreshRate : 60.0, static_cast<double>(streamFps));
 
@@ -110,22 +115,24 @@ void Pacer::init(const std::shared_ptr<DX::DeviceResources> &res, int streamFps,
 }
 
 bool Pacer::getPacingImmediate() {
-	return m_FramePacingImmediate.load(std::memory_order_acquire);
+	return m_PacingMode.load(std::memory_order_acquire) != PACING_DISPLAY_LOCKED;
 }
 
 void Pacer::setPacingImmediate(bool framePacingImmediate) {
-	m_FramePacingImmediate.store(framePacingImmediate, std::memory_order_release);
+	// Quick flip between the two primary modes (used by the #253 menu item).
+	m_PacingMode.store(framePacingImmediate ? PACING_DRAIN : PACING_DISPLAY_LOCKED,
+	                   std::memory_order_release);
 }
 
-int Pacer::getImmediatePacing() {
-	return m_ImmediatePacing.load(std::memory_order_acquire);
+int Pacer::getPacingMode() {
+	return m_PacingMode.load(std::memory_order_acquire);
 }
 
-void Pacer::setImmediatePacing(int mode) {
-	if (mode < PACING_LEGACY || mode > PACING_QT) {
+void Pacer::setPacingMode(int mode) {
+	if (mode < 0 || mode >= PACING_MODE_COUNT) {
 		mode = PACING_DRAIN;
 	}
-	m_ImmediatePacing.store(mode, std::memory_order_release);
+	m_PacingMode.store(mode, std::memory_order_release);
 }
 
 void Pacer::vsyncHardware() {
@@ -238,10 +245,10 @@ void Pacer::waitForFrame(double timeoutMs) {
 bool Pacer::renderOnMainThread(std::shared_ptr<VideoRenderer> &sceneRenderer) {
 	if (!running()) return false;
 
-	if (m_FramePacingImmediate.load(std::memory_order_acquire)) {
-		return renderModeImmediate(sceneRenderer);
-	} else {
+	if (m_PacingMode.load(std::memory_order_acquire) == PACING_DISPLAY_LOCKED) {
 		return renderModeDisplayLocked(sceneRenderer);
+	} else {
+		return renderModeImmediate(sceneRenderer);
 	}
 }
 
@@ -250,38 +257,69 @@ bool Pacer::renderOnMainThread(std::shared_ptr<VideoRenderer> &sceneRenderer) {
 // Pros: lowest latency, output framerate matches input framerate
 // Cons: only works well on Xbox Series for some reason
 bool Pacer::renderModeImmediate(std::shared_ptr<VideoRenderer> &sceneRenderer) {
-	const int mode = m_ImmediatePacing.load(std::memory_order_acquire);
+	const int mode = m_PacingMode.load(std::memory_order_acquire);
 	int droppedToCatchUp = 0;
 	AVFrame *newFrame = nullptr;
 
-	if (mode == PACING_QT) {
-		// moonlight-qt strategy: keep a rolling ~500 ms history of queue depth and
-		// drop to the floor only when the backlog is PERSISTENT, tolerating transient
-		// spikes by briefly buffering (FIFO) instead of dropping. Mirrors
-		// Pacer::handleVsync in moonlight-qt (app/.../ffmpeg-renderers/pacer/pacer.cpp).
-		const int depth = FrameQueue::instance().count();
-		int target = 1; // strict default: drop down to the newest frame
-		// Only apply leniency when the source can outpace the display; otherwise a
-		// backlog can't be sustained by rate, so stay strict (lowest latency).
+	if (mode == PACING_DRAIN) {
+		// Lowest latency: render the NEWEST available frame and discard any older ones,
+		// so no standing buffer can accumulate. In steady state (<= 1 queued) the loop
+		// finds nothing extra and drops nothing.
+		newFrame = FrameQueue::instance().dequeue();
+		if (!newFrame) {
+			return false; // no frame, don't Present()
+		}
+		for (AVFrame *newer; (newer = FrameQueue::instance().dequeue()) != nullptr;) {
+			av_frame_free(&newFrame);
+			newFrame = newer;
+			++droppedToCatchUp;
+		}
+	} else {
+		// PACING_QT / PACING_ADAPTIVE: buffer-target strategies. Drop the OLDEST frames
+		// down to `target`, then render the oldest remaining (FIFO when buffering, newest
+		// when target == 1). They differ only in how `target` is chosen.
+		const int depth = FrameQueue::instance().count(); // sample before dropping
+		int target = 1;                                   // strict default: drop to newest
+		// Leniency only helps when the source can outpace the display; otherwise a backlog
+		// can't be sustained by rate, so stay strict (lowest latency).
 		if (m_StreamFps >= m_RefreshRate) {
-			// Decide leniency from the EXISTING history (qt uses past samples only).
-			for (int entry : m_QueueDepthHistory) {
-				if (entry <= 1) {
-					// Recently resolved to <= 1, so treat the current spike as transient
-					// and buffer up to 3 frames instead of dropping.
-					target = 3;
-					break;
+			if (mode == PACING_QT) {
+				// moonlight-qt hysteresis over a ~500 ms window of queue depth: lenient
+				// (buffer up to 3) if the queue recently resolved to <= 1, else strict.
+				for (int entry : m_QueueDepthHistory) {
+					if (entry <= 1) {
+						target = 3;
+						break;
+					}
+				}
+				int window = static_cast<int>(m_RefreshRate / 2.0);
+				if (window < 1) {
+					window = 1;
+				}
+				if (static_cast<int>(m_QueueDepthHistory.size()) >= window) {
+					m_QueueDepthHistory.pop_front();
+				}
+				m_QueueDepthHistory.push_back(depth);
+			} else {
+				// PACING_ADAPTIVE: size the buffer to the measured arrival jitter
+				// (adaptive-playout style). frameMs is the host frame period.
+				const double frameMs = m_FrameCadence.streamPeriodMs();
+				const double jitterMs = m_ArrivalJitterMs.load(std::memory_order_acquire);
+				if (frameMs > 0.0) {
+					// Cover the jitter TAIL, not just the mean: RFC 3550 J is a mean
+					// deviation, so scale by ~2 to approximate a ~95th-percentile buffer.
+					const double SAFETY = 2.0;
+					const double ratio = (jitterMs * SAFETY) / frameMs; // jitter (tail) in frames
+					int extra = static_cast<int>(ratio);
+					if (static_cast<double>(extra) < ratio) { // ceil for positive ratio
+						extra++;
+					}
+					target = 1 + extra;
+					if (target > 4) { // cap (FrameQueue holds ~5)
+						target = 4;
+					}
 				}
 			}
-			// Then append the current depth, keeping a rolling ~500 ms window.
-			int window = static_cast<int>(m_RefreshRate / 2.0);
-			if (window < 1) {
-				window = 1;
-			}
-			if (static_cast<int>(m_QueueDepthHistory.size()) >= window) {
-				m_QueueDepthHistory.pop_front();
-			}
-			m_QueueDepthHistory.push_back(depth);
 		}
 		// Drop the OLDEST frames until we are at the target depth.
 		while (FrameQueue::instance().count() > target) {
@@ -292,38 +330,9 @@ bool Pacer::renderModeImmediate(std::shared_ptr<VideoRenderer> &sceneRenderer) {
 			av_frame_free(&old);
 			++droppedToCatchUp;
 		}
-		// Render the oldest remaining frame (FIFO when buffering, newest when strict).
 		newFrame = FrameQueue::instance().dequeue();
 		if (!newFrame) {
 			return false; // no frame, don't Present()
-		}
-	} else {
-		newFrame = FrameQueue::instance().dequeue();
-		if (!newFrame) {
-			return false; // no frame, don't Present()
-		}
-
-		if (mode == PACING_DRAIN) {
-			// Lowest latency: render the NEWEST available frame and discard any older
-			// ones, so no standing buffer can accumulate. In steady state (<= 1 queued)
-			// the loop finds nothing extra and drops nothing.
-			for (AVFrame *newer; (newer = FrameQueue::instance().dequeue()) != nullptr;) {
-				av_frame_free(&newFrame);
-				newFrame = newer;
-				++droppedToCatchUp;
-			}
-		} else {
-			// PACING_LEGACY: the original single-shot catch-up (off-by-one that leaves a
-			// metastable standing buffer). Kept for on-device A/B only.
-			int queueDepth = FrameQueue::instance().count();
-			if (queueDepth > FRAME_QUEUE_LOW) {
-				AVFrame *newFrame2 = FrameQueue::instance().dequeue();
-				if (newFrame2) {
-					av_frame_free(&newFrame);
-					newFrame = newFrame2;
-					++droppedToCatchUp;
-				}
-			}
 		}
 	}
 
@@ -450,6 +459,22 @@ void Pacer::submitFrame(AVFrame *frame) {
 	if (frame->pts) {
 		m_FrameCadence.observeFramePts(frame->pts);
 	}
+
+	// Measure frame-arrival jitter as the RFC 3550 smoothed deviation of the actual
+	// inter-arrival time from the expected frame period: J += (|D| - J)/16. Read by
+	// PACING_ADAPTIVE to size the buffer target. Cheap (decoder-thread only).
+	int64_t now = QpcNow();
+	if (m_HaveLastEnqueue) {
+		double arrivalDeltaMs = QpcToMs(now - m_LastEnqueueQpc);
+		double dev = arrivalDeltaMs - m_FrameCadence.streamPeriodMs();
+		if (dev < 0.0) {
+			dev = -dev;
+		}
+		double j = m_ArrivalJitterMs.load(std::memory_order_acquire);
+		m_ArrivalJitterMs.store(j + (dev - j) / 16.0, std::memory_order_release);
+	}
+	m_LastEnqueueQpc = now;
+	m_HaveLastEnqueue = true;
 
 	int dropCount = FrameQueue::instance().enqueue(frame);
 	if (dropCount) {
