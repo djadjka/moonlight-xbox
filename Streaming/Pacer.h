@@ -77,15 +77,20 @@ class Pacer {
 	std::atomic<double> m_ArrivalJitterMs{0.0};
 	int64_t m_LastEnqueueQpc = 0;
 	bool m_HaveLastEnqueue = false;
-	// PACING_ADAPTIVE starve-driven buffer controller (render-thread only -> no atomics,
-	// except the published target read by the stats overlay/CSV). A "starve" is a present
-	// with no fresh frame (empty queue -> a repeated frame = the exact judder a buffer
-	// fixes, from any source). We grow the target fast on a decaying count of recent
-	// starves and shrink it slowly. See renderModeImmediate.
-	double m_StarvePressure = 0.0;   // decaying count of recent starves
+	// PACING_ADAPTIVE buffer controller. Judder source = frames the decoder/network lost,
+	// detected at ENQUEUE via a PTS discontinuity (a dropped frame jumps pts by ~2 periods)
+	// -- a producer-side signal, independent of the render buffer, so it does NOT collapse
+	// when the buffer engages (no oscillation, unlike a render-side starve). We grow the
+	// target fast on a decaying count of recent losses and shrink it slowly. The controller
+	// state below is render-thread only (no atomics) except the two cross-thread atomics.
+	double m_StarvePressure = 0.0;   // decaying count of recent lost/late frames
 	int    m_AdaptiveTarget = 1;     // committed drop target (grow fast, shrink slow)
 	int    m_ShrinkHoldFrames = 0;   // presents the lower demand has held (shrink gate)
-	std::atomic<int> m_AdaptiveTargetPublished{1};  // for the stats overlay/CSV only
+	uint64_t m_LastLostSeen = 0;     // lost-frame events consumed so far (render thread)
+	std::atomic<int> m_AdaptiveTargetPublished{1};   // live target for the overlay/CSV
+	std::atomic<uint64_t> m_LostFrameEvents{0};      // lost frames seen at enqueue (decoder->render)
+	int64_t m_LastFramePts = 0;      // previous enqueued pts (decoder thread, PTS gap detect)
+	bool    m_HaveLastPts = false;   // decoder thread only
 
 	FrameCadence m_FrameCadence;
 	AVFrame* m_CurrentFrame = nullptr;

@@ -34,11 +34,11 @@
 constexpr int FRAME_QUEUE_LOW = 1;
 constexpr int FRAME_QUEUE_HIGH = 3;
 
-// PACING_ADAPTIVE starve-driven buffer controller (starting points; tuned on-device).
-// A "starve" (empty queue at present -> a repeated frame) is the exact judder a buffer
-// fixes, from ANY source (decoder drop, network spike, scene burst). m_StarvePressure is
-// a decaying count of recent starves; it maps to a buffer depth, grows fast and shrinks
-// slowly so the buffer engages only while judder persists and returns to 1 when clean.
+// PACING_ADAPTIVE buffer controller (starting points; tuned on-device). The judder
+// signal is the producer-side lost-frame count (decoder/network drops, detected at
+// enqueue via a PTS gap -- see submitFrame); m_StarvePressure is its decaying count.
+// It maps to a buffer depth, grows fast and shrinks slowly so the buffer engages only
+// while loss persists and returns to 1 (== DRAIN latency) when the link is clean.
 constexpr double kStarveForget = 0.997;          // per-present decay (~2.8 s memory @120fps)
 constexpr double kStarveP1 = 2.0;                // pressure -> target 2 (sustained light judder)
 constexpr double kStarveP2 = 6.0;                // pressure -> target 3
@@ -118,7 +118,10 @@ void Pacer::init(const std::shared_ptr<DX::DeviceResources> &res, int streamFps,
 	m_StarvePressure = 0.0;
 	m_AdaptiveTarget = 1;
 	m_ShrinkHoldFrames = 0;
+	m_LastLostSeen = 0;
 	m_AdaptiveTargetPublished.store(1, std::memory_order_release);
+	m_LostFrameEvents.store(0, std::memory_order_release);
+	m_HaveLastPts = false;
 
 	// Start FrameQueue so it's ready to receive new frames
 	FrameQueue::instance().setHighWaterMark(FRAME_QUEUE_HIGH);
@@ -339,11 +342,15 @@ bool Pacer::renderModeImmediate(std::shared_ptr<VideoRenderer> &sceneRenderer) {
 				m_QueueDepthHistory.push_back(depth);
 			} else {
 				// PACING_ADAPTIVE: size the buffer to recent judder from ANY source
-				// (decoder drops, network spikes, scene bursts) via a decaying starve
-				// controller. Grow fast, shrink slow, so the buffer engages only while
-				// judder persists and returns to 1 (== DRAIN latency) when the link is
-				// clean. The starve itself is recorded at the empty-queue site below.
-				m_StarvePressure *= kStarveForget;
+				// (decoder drops, network loss/spikes) via a decaying controller. Grow
+				// fast, shrink slow, so the buffer engages only while judder persists and
+				// returns to 1 (== DRAIN latency) when the link is clean. The signal is the
+				// producer-side lost-frame count from submitFrame, decoupled from the
+				// render buffer so it doesn't collapse when the buffer engages.
+				uint64_t lostNow = m_LostFrameEvents.load(std::memory_order_acquire);
+				double newLost = static_cast<double>(lostNow - m_LastLostSeen);
+				m_LastLostSeen = lostNow;
+				m_StarvePressure = m_StarvePressure * kStarveForget + newLost;
 
 				// Reactive term: map the decaying starve rate to a buffer depth.
 				int desired = 1;
@@ -393,12 +400,6 @@ bool Pacer::renderModeImmediate(std::shared_ptr<VideoRenderer> &sceneRenderer) {
 		}
 		newFrame = FrameQueue::instance().dequeue();
 		if (!newFrame) {
-			// Starve: no fresh frame this present (-> a repeated frame). Feed the
-			// PACING_ADAPTIVE controller so the buffer grows. Gated like the target, so
-			// expected alternate-present gaps (source slower than display) don't count.
-			if (mode == PACING_ADAPTIVE && m_StreamFps >= m_RefreshRate) {
-				m_StarvePressure += 1.0;
-			}
 			return false; // no frame, don't Present()
 		}
 	}
@@ -542,6 +543,28 @@ void Pacer::submitFrame(AVFrame *frame) {
 	}
 	m_LastEnqueueQpc = now;
 	m_HaveLastEnqueue = true;
+
+	// Producer-side judder signal for PACING_ADAPTIVE: count frames the decoder/network
+	// lost via a PTS discontinuity (a dropped frame jumps pts by ~2 periods). Measured
+	// here at enqueue, so it stays elevated under sustained loss even after the buffer
+	// hides the resulting render-side starves -> the controller can't oscillate.
+	if (frame->pts && m_HaveLastPts) {
+		double periodPts = m_FrameCadence.streamPeriodMs() * 90.0; // pts is 90 kHz
+		if (periodPts > 0.0) {
+			double deltaPts = static_cast<double>(frame->pts - m_LastFramePts);
+			int lost = static_cast<int>((deltaPts / periodPts) + 0.5) - 1; // missing frames in the gap
+			if (lost > 0) {
+				if (lost > 4) {
+					lost = 4; // clamp a discontinuity (seek/reinit) so it can't pin the buffer
+				}
+				m_LostFrameEvents.fetch_add(static_cast<uint64_t>(lost), std::memory_order_release);
+			}
+		}
+	}
+	if (frame->pts) {
+		m_LastFramePts = frame->pts;
+		m_HaveLastPts = true;
+	}
 
 	int dropCount = FrameQueue::instance().enqueue(frame);
 	if (dropCount) {
