@@ -43,8 +43,19 @@ class Pacer {
 	// Scene class for the auto-tuner. Auto-detected from the loss breakdown (Stats), not
 	// labelled by hand: network loss vs decoder can't-keep-up vs clean.
 	enum Condition { COND_CLEAN = 0, COND_PACING = 1, COND_NETWORK = 2, COND_COUNT = 3 };
-	// Current-condition objective readout for the overlay. score = stutter/1k + 10*(avgTarget-1).
-	struct TuneView { int cond; double avgTarget; double stutterPer1k; double score; double p1, p2, p3; };
+	// Current-condition objective readout for the overlay (debug auto-tuner).
+	struct TuneView {
+		int    cond;          // detected scene class
+		double samples;       // presents accumulated in this scene since the last reset
+		double lossPer1k;     // producer-side lost-frame events per 1000 presents
+		int    maxBurst;      // largest loss burst seen (frames) -> drives the needed depth
+		int    neededDepth;   // buffer depth this scene needs (1 + maxBurst, +safety)
+		double avgTarget;     // mean buffer depth the controller actually used
+		double stutterPer1k;  // residual render-starves per 1000 presents (validation)
+		double meanPressure;  // mean decaying loss pressure (threshold x-axis)
+		double score;         // objective = stutterPer1k + 10*(avgTarget-1)
+		double p1, p2, p3;    // current fitted thresholds
+	};
 	TuneView getTuneView();
 	void waitForFrame(double timeoutMs);
 	bool renderOnMainThread(std::shared_ptr<moonlight_xbox_dx::VideoRenderer> &sceneRenderer);
@@ -109,14 +120,25 @@ class Pacer {
 	std::atomic<int>    m_pStarveShrinkHoldFrames{120};  // presents of lower demand before stepping down
 
 	// --- On-device auto-tuner (debug) -----------------------------------------------
-	// Per-condition running stats (render-thread EWMA, ~8 s memory), bucketed by the scene
-	// class auto-detected from the loss breakdown (detectedCondition()), so the overlay
-	// readout and recomputeWeights() can fit p1/p2/p3 on-device with no manual labelling.
-	// Plain doubles: 8-byte aligned reads are atomic on x64, races are benign here.
-	int detectedCondition();          // current auto-classified scene (from Stats)
-	double m_CondTarget[COND_COUNT]   = {1.0, 1.0, 1.0}; // EWMA committed target
-	double m_CondStarve[COND_COUNT]   = {0.0, 0.0, 0.0}; // EWMA render-starve rate (residual judder)
-	double m_CondPressure[COND_COUNT] = {0.0, 0.0, 0.0}; // EWMA loss pressure
+	// Per-condition COUNT accumulators (not EWMA snapshots), bucketed by the auto-detected
+	// scene class. recomputeWeights() fits p1/p2/p3 directly from the measured loss-burst
+	// distribution -- a buffer of depth 1+burst absorbs a burst of that size, so the needed
+	// depth is read straight off the producer-side signal, independent of the controller's
+	// current target (non-circular: converges in one pass). Counts accumulate over the whole
+	// measurement window so scene length doesn't bias the fit; cleared on init / Reset logs /
+	// after Recompute (each Optimize starts a fresh measurement window).
+	int  detectedCondition();          // current auto-classified scene (from Stats)
+	int  neededDepthFor(int cond);     // depth this scene needs, from its burst distribution
+	void clearTunerStats();            // zero every accumulator (fresh measurement window)
+	// Loss-burst histogram: the decoder thread (submitFrame) increments by burst size 1..4,
+	// the UI thread reads/zeroes it -> atomic. Index 0 is unused.
+	std::atomic<uint64_t> m_CondBurst[COND_COUNT][5] = {};
+	// Render-thread accumulators (UI thread reads/zeroes; an 8-byte aligned double R/W is
+	// atomic on x64 and the reset race is benign for a debug tuner).
+	double m_CondPresents[COND_COUNT]  = {0.0, 0.0, 0.0}; // adaptive ticks observed
+	double m_CondStarves[COND_COUNT]   = {0.0, 0.0, 0.0}; // render-side starves (residual judder)
+	double m_CondPressSum[COND_COUNT]  = {0.0, 0.0, 0.0}; // sum of loss pressure (-> mean)
+	double m_CondTargetSum[COND_COUNT] = {0.0, 0.0, 0.0}; // sum of committed target (-> mean)
 
 	FrameCadence m_FrameCadence;
 	AVFrame* m_CurrentFrame = nullptr;

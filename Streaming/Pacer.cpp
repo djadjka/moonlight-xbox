@@ -35,6 +35,15 @@
 constexpr int FRAME_QUEUE_LOW = 1;
 constexpr int FRAME_QUEUE_HIGH = 3;
 
+// On-device auto-tuner (debug) fit constants. The needed buffer depth for a scene is read
+// off its loss-burst distribution; these gate noise and keep clean scenes at the floor.
+constexpr double kTunerMinSamples   = 500.0; // presents a scene needs before it counts (~4 s @120)
+constexpr double kTunerBurstFloor1k = 5.0;   // a burst size must recur >= this/1k to buffer for it
+                                             // (rejects ~1 s of transition-lag misclassification;
+                                             //  genuine drop scenes lose frames at 10s-100s/1k)
+constexpr double kTunerStutter1k    = 5.0;   // residual starves/1k above which a depth is under-buffered
+constexpr double kTunerP1Floor      = 1.0;   // never set p1 below this -> clean (pressure ~0) stays depth 1
+
 // PACING_ADAPTIVE buffer controller. The judder signal is the producer-side lost-frame
 // count (decoder/network drops, detected at enqueue via a PTS gap -- see submitFrame);
 // m_StarvePressure is its decaying count. It maps to a buffer depth, grows fast and
@@ -122,6 +131,7 @@ void Pacer::init(const std::shared_ptr<DX::DeviceResources> &res, int streamFps,
 	m_AdaptiveTargetPublished.store(1, std::memory_order_release);
 	m_LostFrameEvents.store(0, std::memory_order_release);
 	m_HaveLastPts = false;
+	clearTunerStats();
 
 	// Start FrameQueue so it's ready to receive new frames
 	FrameQueue::instance().setHighWaterMark(FRAME_QUEUE_HIGH);
@@ -207,11 +217,45 @@ void Pacer::resetTraceLogs() {
 	if (m_DeviceResources && m_DeviceResources->GetStats()) {
 		m_DeviceResources->GetStats()->resetCsv();
 	}
+	clearTunerStats();
+}
+
+// Zero every auto-tuner accumulator so the next measurement window starts clean. Called on
+// init, by the Reset-logs button, and at the end of recomputeWeights (fresh iteration).
+void Pacer::clearTunerStats() {
 	for (int c = 0; c < COND_COUNT; ++c) {
-		m_CondTarget[c] = 1.0;
-		m_CondStarve[c] = 0.0;
-		m_CondPressure[c] = 0.0;
+		m_CondPresents[c] = 0.0;
+		m_CondStarves[c] = 0.0;
+		m_CondPressSum[c] = 0.0;
+		m_CondTargetSum[c] = 0.0;
+		for (int k = 0; k < 5; ++k) {
+			m_CondBurst[c][k].store(0, std::memory_order_relaxed);
+		}
 	}
+}
+
+// Depth this scene needs, read straight off its loss-burst distribution: a buffer of depth
+// 1+burst keeps the on-screen cadence smooth across a gap of that size. Bursts that don't
+// recur often enough (a one-off seek/reinit) are ignored; a residual starve at the
+// burst-sized depth (late arrivals that weren't flagged as a PTS gap) bumps it one more.
+int Pacer::neededDepthFor(int c) {
+	if (c < 0 || c >= COND_COUNT) return 1;
+	double n = m_CondPresents[c];
+	if (n < kTunerMinSamples) return 1; // too little data: assume clean (low-latency floor)
+	int maxK = 0;
+	for (int k = 1; k <= 4; ++k) {
+		double rate1k = static_cast<double>(m_CondBurst[c][k].load(std::memory_order_relaxed)) / n * 1000.0;
+		if (rate1k >= kTunerBurstFloor1k) {
+			maxK = k; // bursts of this size recur often enough to permanently buffer for
+		}
+	}
+	int need = 1 + maxK;
+	double stut1k = m_CondStarves[c] / n * 1000.0;
+	if (stut1k > kTunerStutter1k && need < 4) {
+		need += 1; // still starving at the burst-sized depth -> one deeper
+	}
+	if (need > 4) need = 4;
+	return need;
 }
 
 // Current scene class, auto-detected by Stats from the per-second loss breakdown. Render
@@ -227,46 +271,61 @@ int Pacer::detectedCondition() {
 }
 
 Pacer::TuneView Pacer::getTuneView() {
-	TuneView v;
+	TuneView v{};
 	int c = detectedCondition();
 	v.cond = c;
-	v.avgTarget = m_CondTarget[c];
-	v.stutterPer1k = m_CondStarve[c] * 1000.0;
+	double n = m_CondPresents[c];
+	v.samples = n;
+	double loss1k = 0.0;
+	int maxK = 0;
+	for (int k = 1; k <= 4; ++k) {
+		uint64_t cnt = m_CondBurst[c][k].load(std::memory_order_relaxed);
+		if (n > 0.0) loss1k += static_cast<double>(cnt) / n * 1000.0;
+		if (cnt > 0) maxK = k;
+	}
+	v.lossPer1k = loss1k;
+	v.maxBurst = maxK;
+	v.neededDepth = neededDepthFor(c);
+	v.avgTarget = n > 0.0 ? m_CondTargetSum[c] / n : 1.0;
+	v.stutterPer1k = n > 0.0 ? m_CondStarves[c] / n * 1000.0 : 0.0;
+	v.meanPressure = n > 0.0 ? m_CondPressSum[c] / n : 0.0;
+	v.score = v.stutterPer1k + 10.0 * (v.avgTarget - 1.0);
 	v.p1 = m_pStarveP1.load(std::memory_order_relaxed);
 	v.p2 = m_pStarveP2.load(std::memory_order_relaxed);
 	v.p3 = m_pStarveP3.load(std::memory_order_relaxed);
-	v.score = v.stutterPer1k + 10.0 * (v.avgTarget - 1.0);
 	return v;
 }
 
-// Fit p1/p2/p3 from the per-condition stats and apply them live + persist. For each
-// labelled condition, the smallest buffer target that holds the residual starve rate
-// under threshold is the target that condition needs; the thresholds are then placed
-// just below the loss pressure at which each higher target became necessary.
+// Fit p1/p2/p3 from the per-condition stats and apply them live + persist. Each scene's
+// needed depth is read off its loss-burst distribution (neededDepthFor: depth 1+burst
+// absorbs a burst of that size) -- a producer-side measurement, independent of the depth
+// the controller is currently choosing, so the fit is NOT circular and converges in one
+// pass. Each higher-depth threshold is then placed just below the loss pressure of the
+// lightest scene that still needs that depth, so the controller steps up exactly when such
+// a scene is active and no sooner.
 void Pacer::recomputeWeights() {
-	const double kStutterThresh1k = 5.0; // starves/1k above which a depth is under-buffered
-	int needed[COND_COUNT];
+	int    needed[COND_COUNT];
+	double meanPress[COND_COUNT];
 	for (int c = 0; c < COND_COUNT; ++c) {
-		int t = static_cast<int>(m_CondTarget[c] + 0.5);
-		if (t < 1) t = 1;
-		if (m_CondStarve[c] * 1000.0 > kStutterThresh1k && t < 4) {
-			t += 1; // still juddering at this depth -> needs one more
-		}
-		needed[c] = t;
+		needed[c] = neededDepthFor(c);
+		meanPress[c] = m_CondPresents[c] > 0.0 ? m_CondPressSum[c] / m_CondPresents[c] : 0.0;
 	}
+
 	double newP[3] = {1e9, 1e9, 1e9}; // p1,p2,p3; 1e9 = that depth is never reached
 	for (int level = 2; level <= 4; ++level) {
 		double minP = 1e9;
 		for (int c = 0; c < COND_COUNT; ++c) {
-			if (needed[c] >= level && m_CondPressure[c] < minP) {
-				minP = m_CondPressure[c];
+			// Only trust a scene with enough data behind it.
+			if (needed[c] >= level && m_CondPresents[c] >= kTunerMinSamples && meanPress[c] < minP) {
+				minP = meanPress[c];
 			}
 		}
 		if (minP < 1e9) {
 			newP[level - 2] = minP * 0.9; // sit just below the observed pressure
 		}
 	}
-	if (newP[1] < newP[0]) newP[1] = newP[0]; // keep thresholds monotonic
+	if (newP[0] < kTunerP1Floor) newP[0] = kTunerP1Floor; // keep clean (pressure ~0) at depth 1
+	if (newP[1] < newP[0]) newP[1] = newP[0];             // keep thresholds monotonic
 	if (newP[2] < newP[1]) newP[2] = newP[1];
 	m_pStarveP1.store(newP[0], std::memory_order_relaxed);
 	m_pStarveP2.store(newP[1], std::memory_order_relaxed);
@@ -289,17 +348,14 @@ void Pacer::recomputeWeights() {
 	} catch (...) {
 		// best effort
 	}
-	Utils::Logf("Pacer recompute: needed[clean=%d pacing=%d net=%d] -> p1=%.2f p2=%.2f p3=%.2f\n",
-	            needed[COND_CLEAN], needed[COND_PACING], needed[COND_NETWORK], newP[0], newP[1], newP[2]);
+	Utils::Logf("Pacer recompute: need[clean=%d pacing=%d net=%d] press[%.2f/%.2f/%.2f] -> p1=%.2f p2=%.2f p3=%.2f\n",
+	            needed[COND_CLEAN], needed[COND_PACING], needed[COND_NETWORK],
+	            meanPress[COND_CLEAN], meanPress[COND_PACING], meanPress[COND_NETWORK],
+	            newP[0], newP[1], newP[2]);
 
-	// Start the next tuning iteration from a clean slate: clear the per-condition stats so
-	// the next Recompute fits only behaviour observed under the weights just applied (no
-	// carry-over from prior iterations).
-	for (int c = 0; c < COND_COUNT; ++c) {
-		m_CondTarget[c] = 1.0;
-		m_CondStarve[c] = 0.0;
-		m_CondPressure[c] = 0.0;
-	}
+	// Start the next iteration from a clean slate so it measures only behaviour under the
+	// weights just applied (no carry-over from prior iterations).
+	clearTunerStats();
 }
 
 void Pacer::vsyncHardware() {
@@ -531,13 +587,13 @@ bool Pacer::renderModeImmediate(std::shared_ptr<VideoRenderer> &sceneRenderer) {
 				target = m_AdaptiveTarget;
 				m_AdaptiveTargetPublished.store(target, std::memory_order_release);
 
-				// Auto-tuner accumulator: per-condition EWMA of target/pressure, and decay
-				// of the starve rate (a starve this present is added at the dequeue site).
+				// Auto-tuner accumulator (debug): count this adaptive tick under the detected
+				// scene and sum the signals the fit needs. Counts (not EWMAs) so the fit is
+				// robust to scene length; the loss-burst histogram is filled at enqueue.
 				const int cond = detectedCondition();
-				const double a = 0.001; // ~8 s memory @120fps
-				m_CondStarve[cond]   *= (1.0 - a);
-				m_CondTarget[cond]    = m_CondTarget[cond] * (1.0 - a) + m_AdaptiveTarget * a;
-				m_CondPressure[cond]  = m_CondPressure[cond] * (1.0 - a) + m_StarvePressure * a;
+				m_CondPresents[cond]  += 1.0;
+				m_CondPressSum[cond]  += m_StarvePressure;
+				m_CondTargetSum[cond] += m_AdaptiveTarget;
 			}
 		}
 		// Drop the OLDEST frames until we are at the target depth.
@@ -555,7 +611,7 @@ bool Pacer::renderModeImmediate(std::shared_ptr<VideoRenderer> &sceneRenderer) {
 			// target. Measurement only -- it does NOT feed the controller (that would
 			// re-introduce oscillation); it just records how well this depth is working.
 			if (mode == PACING_ADAPTIVE) {
-				m_CondStarve[detectedCondition()] += 0.001;
+				m_CondStarves[detectedCondition()] += 1.0;
 			}
 			return false; // no frame, don't Present()
 		}
@@ -715,6 +771,12 @@ void Pacer::submitFrame(AVFrame *frame) {
 					lost = 4; // clamp a discontinuity (seek/reinit) so it can't pin the buffer
 				}
 				m_LostFrameEvents.fetch_add(static_cast<uint64_t>(lost), std::memory_order_release);
+				// Auto-tuner (debug): bucket the burst size under the current scene so
+				// recomputeWeights can read the needed depth straight off the distribution.
+				int c = detectedCondition();
+				if (c >= 0 && c < COND_COUNT) {
+					m_CondBurst[c][lost].fetch_add(1, std::memory_order_relaxed);
+				}
 			}
 		}
 	}

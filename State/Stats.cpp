@@ -461,14 +461,16 @@ void Stats::formatVideoStats(DX::StepTimer const& timer, VIDEO_STATS& stats, cha
 
 		offset += ret;
 
-		// Auto-tuner readout (debug): the objective the adaptive weights minimise + the weights.
+		// Auto-tuner readout (debug): the raw signal the fit reads (loss bursts -> needed
+		// depth), what the controller is doing (tgt/stutter), and the current weights.
 		if (Pacer::instance().getPacingMode() == Pacer::PACING_ADAPTIVE) {
 			Pacer::TuneView tv = Pacer::instance().getTuneView();
 			const char *condName = tv.cond == Pacer::COND_CLEAN ? "clean"
 			                     : tv.cond == Pacer::COND_PACING ? "pacing-drops" : "network-drops";
 			ret = snprintf(&output[offset], length - offset,
-			               "Pacing tune [%s]: tgt %.2f  stutter %.1f/1k  score %.1f  | p %.1f/%.1f/%.1f\n",
-			               condName, tv.avgTarget, tv.stutterPer1k, tv.score, tv.p1, tv.p2, tv.p3);
+			               "Tune[%s] n=%.0f loss/1k=%.1f(x%d) need=%d tgt=%.2f stut=%.1f/1k p=%.1f/%.1f/%.1f\n",
+			               condName, tv.samples, tv.lossPer1k, tv.maxBurst, tv.neededDepth,
+			               tv.avgTarget, tv.stutterPer1k, tv.p1, tv.p2, tv.p3);
 			if (ret > 0 && (size_t)ret < (length - offset)) {
 				offset += ret;
 			}
