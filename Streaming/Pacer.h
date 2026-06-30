@@ -26,7 +26,8 @@ class Pacer {
 		PACING_DRAIN = 1,           // immediate: render newest, drop older every present (lowest latency)
 		PACING_QT = 2,              // immediate: moonlight-qt hysteresis (drop only on a persistent backlog)
 		PACING_ADAPTIVE = 3,        // immediate: buffer target sized to measured arrival jitter
-		PACING_MODE_COUNT = 4,      // for cycling
+		PACING_LEGACY = 4,          // immediate: original upstream off-by-one (for A/B against the bug)
+		PACING_MODE_COUNT = 5,      // for cycling
 	};
 
 	void deinit();

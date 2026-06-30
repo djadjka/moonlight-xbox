@@ -304,6 +304,7 @@ void Stats::formatVideoStats(DX::StepTimer const& timer, VIDEO_STATS& stats, cha
 			case Pacer::PACING_DISPLAY_LOCKED: pacingModeStr = "display-locked";      break;
 			case Pacer::PACING_QT:             pacingModeStr = "immediate, qt";       break;
 			case Pacer::PACING_ADAPTIVE:       pacingModeStr = "immediate, adaptive"; break;
+			case Pacer::PACING_LEGACY:         pacingModeStr = "immediate, legacy";   break;
 			default:                           pacingModeStr = "immediate, drain";    break;
 		}
 

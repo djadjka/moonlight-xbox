@@ -274,6 +274,22 @@ bool Pacer::renderModeImmediate(std::shared_ptr<VideoRenderer> &sceneRenderer) {
 			newFrame = newer;
 			++droppedToCatchUp;
 		}
+	} else if (mode == PACING_LEGACY) {
+		// Original upstream off-by-one (single-shot catch-up). Kept selectable only for
+		// on-device A/B against the metastable standing buffer it produces.
+		newFrame = FrameQueue::instance().dequeue();
+		if (!newFrame) {
+			return false; // no frame, don't Present()
+		}
+		int queueDepth = FrameQueue::instance().count();
+		if (queueDepth > FRAME_QUEUE_LOW) {
+			AVFrame *newFrame2 = FrameQueue::instance().dequeue();
+			if (newFrame2) {
+				av_frame_free(&newFrame);
+				newFrame = newFrame2;
+				++droppedToCatchUp;
+			}
+		}
 	} else {
 		// PACING_QT / PACING_ADAPTIVE: buffer-target strategies. Drop the OLDEST frames
 		// down to `target`, then render the oldest remaining (FIFO when buffering, newest
