@@ -323,8 +323,12 @@ void Pacer::recomputeWeights() {
 	for (int level = 2; level <= 4; ++level) {
 		double minP = 1e9;
 		for (int c = 0; c < COND_COUNT; ++c) {
-			// Only trust a scene with enough data behind it.
-			if (needed[c] >= level && m_CondPresents[c] >= kTunerMinSamples && meanPress[c] < minP) {
+			// Only a scene with enough data AND real loss pressure can place a pressure
+			// threshold. This rejects clean/jitter scenes (pressure ~0, but a render starve
+			// from a late-but-present frame can bump needed depth) from dragging p1 to the
+			// floor -- a zero-pressure scene can't meaningfully sit on the pressure axis.
+			if (needed[c] >= level && m_CondPresents[c] >= kTunerMinSamples &&
+			    meanPress[c] >= kTunerP1Floor && meanPress[c] < minP) {
 				minP = meanPress[c];
 			}
 		}
