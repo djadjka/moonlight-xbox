@@ -40,6 +40,14 @@ bool Stats::ShouldUpdateDisplay(DX::StepTimer const& timer, bool isVisible, char
 			shouldUpdate = true;
 		}
 
+		// CSV trace: snapshot the just-completed 1s window (computes fps) and append a
+		// row, regardless of overlay visibility. Each row carries the active pacing mode.
+		{
+			VIDEO_STATS csvStats = {};
+			addVideoStats(timer, m_ActiveWndVideoStats, csvStats);
+			logCsvLine(csvStats, timer.GetTotalSeconds());
+		}
+
 		// Accumulate these values into the global stats
 		addVideoStats(timer, m_ActiveWndVideoStats, m_GlobalVideoStats);
 
@@ -202,6 +210,56 @@ void Stats::addVideoStats(DX::StepTimer const& timer, VIDEO_STATS& src, VIDEO_ST
 	dst.receivedFps = (double)dst.receivedFrames / (now - dst.measurementStartTimestamp);
 	dst.decodedFps = (double)dst.decodedFrames / (now - dst.measurementStartTimestamp);
 	dst.renderedFps = (double)dst.renderedFrames / (now - dst.measurementStartTimestamp);
+}
+
+// Append one CSV row per 1s window to LocalState\pacing_log.csv (pull via Device Portal).
+// Each row is self-labelled with the active pacing mode so a session that cycles modes can
+// be split per-mode for analysis. Always-on while streaming; ~1 line/sec.
+void Stats::logCsvLine(VIDEO_STATS& s, double now) {
+	if (!m_csvLog.is_open()) {
+		try {
+			auto folder = Windows::Storage::ApplicationData::Current->LocalFolder;
+			std::wstring path(folder->Path->Data());
+			path += L"\\pacing_log.csv";
+			m_csvLog.open(path.c_str(), std::ios::app);
+		} catch (...) {
+			return;
+		}
+		if (!m_csvLog.is_open()) {
+			return;
+		}
+	}
+	if (!m_csvHeaderWritten) {
+		m_csvLog << "# --- session start ---\n"
+		         << "t_s,mode,recv_fps,dec_fps,rend_fps,frames_in_q,q_ms,render_ms,present_ms,decode_ms,net_drop_pct,pacer_drops,rtt_ms,bitrate_mbps\n";
+		m_csvHeaderWritten = true;
+	}
+
+	const char* mode;
+	switch (Pacer::instance().getPacingMode()) {
+		case Pacer::PACING_DISPLAY_LOCKED: mode = "display-locked"; break;
+		case Pacer::PACING_QT:             mode = "qt";             break;
+		case Pacer::PACING_ADAPTIVE:       mode = "adaptive";       break;
+		case Pacer::PACING_LEGACY:         mode = "legacy";         break;
+		default:                           mode = "drain";          break;
+	}
+
+	double q_ms       = s.renderedFrames ? (double) s.totalPacerTimeUs / 1000.0 / s.renderedFrames : 0.0;
+	double render_ms  = s.renderedFrames ? (double) s.totalRenderTimeUs / 1000.0 / s.renderedFrames : 0.0;
+	double present_ms = s.renderedFrames ? (double) s.totalPresentTimeUs / 1000.0 / s.renderedFrames : 0.0;
+	double decode_ms  = s.decodedFrames ? s.totalDecodeTime / s.decodedFrames : 0.0;
+	double net_drop   = s.totalFrames ? (double) s.networkDroppedFrames * 100.0 / s.totalFrames : 0.0;
+
+	char buf[320];
+	int n = snprintf(buf, sizeof(buf),
+	                 "%.1f,%s,%.2f,%.2f,%.2f,%.2f,%.3f,%.3f,%.3f,%.3f,%.3f,%u,%u,%.1f\n",
+	                 now, mode, s.receivedFps, s.decodedFps, s.renderedFps,
+	                 m_avgQueueSize, q_ms, render_ms, present_ms, decode_ms,
+	                 net_drop, s.pacerDroppedFrames, s.lastRtt, m_bwTracker.GetAverageMbps());
+	if (n > 0) {
+		m_csvLog.write(buf, n);
+		m_csvLog.flush();
+	}
 }
 
 void Stats::formatVideoStats(DX::StepTimer const& timer, VIDEO_STATS& stats, char* output, size_t length) {

@@ -1,6 +1,7 @@
 #pragma once
 
 #include "pch.h"
+#include <fstream>
 #include <mutex>
 #include <string>
 #include "../Common/StepTimer.h"
@@ -68,8 +69,11 @@ namespace moonlight_xbox_dx
 	private:
 		void addVideoStats(DX::StepTimer const& timer, VIDEO_STATS& src, VIDEO_STATS& dst);
 		void formatVideoStats(DX::StepTimer const& timer, VIDEO_STATS& stats, char* output, size_t length);
+		void logCsvLine(VIDEO_STATS& stats, double now);
 
 		std::mutex                           m_mutex;
+		std::ofstream                        m_csvLog;
+		bool                                 m_csvHeaderWritten = false;
 
 		// Moonlight stats overlay
 		VIDEO_STATS                          m_ActiveWndVideoStats;
