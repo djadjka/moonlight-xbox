@@ -37,6 +37,8 @@ class Pacer {
 	int getPacingMode();
 	void setPacingMode(int mode);
 	int getAdaptiveTarget();                // current PACING_ADAPTIVE drop target (stats/overlay)
+	void loadTuningParams();                // re-read adaptive constants from LocalState (no rebuild)
+	void resetTraceLogs();                  // clear the CSV pacing trace (debug)
 	void waitForFrame(double timeoutMs);
 	bool renderOnMainThread(std::shared_ptr<moonlight_xbox_dx::VideoRenderer> &sceneRenderer);
 	bool waitBeforePresent(int64_t deadline);
@@ -68,7 +70,7 @@ class Pacer {
 	std::atomic<bool> m_Stopping{false};
 	int m_StreamFps;
 	double m_RefreshRate;
-	std::atomic<int> m_PacingMode{PACING_DRAIN};
+	std::atomic<int> m_PacingMode{PACING_ADAPTIVE};
 	// Rolling history of pre-dequeue queue depth, used by PACING_QT to drop only
 	// on a persistent backlog (touched only on the render thread).
 	std::deque<int> m_QueueDepthHistory;
@@ -91,6 +93,13 @@ class Pacer {
 	std::atomic<uint64_t> m_LostFrameEvents{0};      // lost frames seen at enqueue (decoder->render)
 	int64_t m_LastFramePts = 0;      // previous enqueued pts (decoder thread, PTS gap detect)
 	bool    m_HaveLastPts = false;   // decoder thread only
+	// Live-tunable PACING_ADAPTIVE constants (defaults here; overridable on-device via
+	// LocalState\pacing_params.txt + loadTuningParams, so no rebuild to tune).
+	std::atomic<double> m_pStarveForget{0.997};          // per-present decay (~2.8 s memory @120fps)
+	std::atomic<double> m_pStarveP1{2.0};                // pressure -> target 2
+	std::atomic<double> m_pStarveP2{6.0};                // pressure -> target 3
+	std::atomic<double> m_pStarveP3{12.0};               // pressure -> target 4
+	std::atomic<int>    m_pStarveShrinkHoldFrames{120};  // presents of lower demand before stepping down
 
 	FrameCadence m_FrameCadence;
 	AVFrame* m_CurrentFrame = nullptr;

@@ -73,6 +73,7 @@ namespace moonlight_xbox_dx
 		void SubmitPresentPacing(double presentDisplayMs);
 		void SubmitRenderStats(double preWaitTimeMs, double renderTimeMs, double presentTimeMs, bool hitDeadline);
 		void SubmitFrametime(double frametimeMs);  // on-screen interval between new frames (judder)
+		void resetCsv();                            // clear the in-memory + on-disk pacing trace (debug)
 
 	private:
 		void addVideoStats(DX::StepTimer const& timer, VIDEO_STATS& src, VIDEO_STATS& dst);

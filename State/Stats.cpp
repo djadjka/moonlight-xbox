@@ -305,6 +305,23 @@ void Stats::flushCsv() {
 	}
 }
 
+// Clear the pacing trace (in-memory buffer + on-disk file) so the next on-device test
+// run starts clean, without a reconnect or rebuild. Locked against the render thread's
+// logCsvLine. Resetting m_csvHeaderWritten makes the next line re-emit the header.
+void Stats::resetCsv() {
+	std::scoped_lock<std::mutex> lock(m_mutex);
+	m_csvBuffer.clear();
+	m_csvHeaderWritten = false;
+	try {
+		auto folder = Windows::Storage::ApplicationData::Current->LocalFolder;
+		std::wstring path(folder->Path->Data());
+		path += L"\\pacing_log.csv";
+		std::ofstream f(path.c_str(), std::ios::trunc | std::ios::binary); // empty the file
+	} catch (...) {
+		// best effort
+	}
+}
+
 void Stats::formatVideoStats(DX::StepTimer const& timer, VIDEO_STATS& stats, char* output, size_t length) {
 	FFMpegDecoder& ffmpeg = FFMpegDecoder::instance();
 

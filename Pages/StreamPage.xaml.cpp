@@ -322,17 +322,23 @@ void StreamPage::resetDecoder_Click(Platform::Object^ sender, Windows::UI::Xaml:
 
 void StreamPage::toggleFramePacing_Click(Platform::Object^ sender, Windows::UI::Xaml::RoutedEventArgs^ e)
 {
-	// thread safe atomic bool
-	bool isImmediate = Pacer::instance().getPacingImmediate();
-	Pacer::instance().setPacingImmediate(isImmediate ? false : true);
+	// Flip between the two shipped modes: adaptive <-> display-locked. Thread-safe atomic.
+	int mode = Pacer::instance().getPacingMode();
+	Pacer::instance().setPacingMode(mode == Pacer::PACING_ADAPTIVE ? Pacer::PACING_DISPLAY_LOCKED
+	                                                               : Pacer::PACING_ADAPTIVE);
 }
 
 void StreamPage::cyclePacingMode_Click(Platform::Object^ sender, Windows::UI::Xaml::RoutedEventArgs^ e)
 {
-	// Debug A/B: cycle the pacing strategy display-locked -> drain -> qt -> adaptive -> ...
-	// thread safe atomic int
-	int mode = Pacer::instance().getPacingMode();
-	Pacer::instance().setPacingMode((mode + 1) % Pacer::PACING_MODE_COUNT);
+	// Debug: re-read the adaptive tuning constants from LocalState\pacing_params.txt so
+	// they can be tuned on-device without a rebuild.
+	Pacer::instance().loadTuningParams();
+}
+
+void StreamPage::resetTraceLogs_Click(Platform::Object^ sender, Windows::UI::Xaml::RoutedEventArgs^ e)
+{
+	// Debug: clear the CSV pacing trace so the next test run starts clean.
+	Pacer::instance().resetTraceLogs();
 }
 
 void StreamPage::OnPropertyChanged(Platform::String^ propertyName)

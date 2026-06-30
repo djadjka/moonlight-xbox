@@ -4,6 +4,7 @@
 #include "Pacer.h"
 #include <algorithm>
 #include <chrono>
+#include <fstream>
 #include <thread>
 #include <windows.h>
 #include "../Plot/ImGuiPlots.h"
@@ -34,16 +35,12 @@
 constexpr int FRAME_QUEUE_LOW = 1;
 constexpr int FRAME_QUEUE_HIGH = 3;
 
-// PACING_ADAPTIVE buffer controller (starting points; tuned on-device). The judder
-// signal is the producer-side lost-frame count (decoder/network drops, detected at
-// enqueue via a PTS gap -- see submitFrame); m_StarvePressure is its decaying count.
-// It maps to a buffer depth, grows fast and shrinks slowly so the buffer engages only
-// while loss persists and returns to 1 (== DRAIN latency) when the link is clean.
-constexpr double kStarveForget = 0.997;          // per-present decay (~2.8 s memory @120fps)
-constexpr double kStarveP1 = 2.0;                // pressure -> target 2 (sustained light judder)
-constexpr double kStarveP2 = 6.0;                // pressure -> target 3
-constexpr double kStarveP3 = 12.0;               // pressure -> target 4
-constexpr int    kStarveShrinkHoldFrames = 120;  // ~1 s of lower demand before stepping down
+// PACING_ADAPTIVE buffer controller. The judder signal is the producer-side lost-frame
+// count (decoder/network drops, detected at enqueue via a PTS gap -- see submitFrame);
+// m_StarvePressure is its decaying count. It maps to a buffer depth, grows fast and
+// shrinks slowly so the buffer engages only while loss persists and returns to 1
+// (== DRAIN latency) when the link is clean. The constants (forget/p1/p2/p3/shrink_hold)
+// are live-tunable members, defaulted in Pacer.h and reloadable via loadTuningParams.
 
 using steady_clock = std::chrono::steady_clock;
 using namespace moonlight_xbox_dx;
@@ -98,8 +95,11 @@ void Pacer::init(const std::shared_ptr<DX::DeviceResources> &res, int streamFps,
 	if (!framePacingImmediate) {
 		m_PacingMode.store(PACING_DISPLAY_LOCKED, std::memory_order_release);
 	} else if (m_PacingMode.load(std::memory_order_acquire) == PACING_DISPLAY_LOCKED) {
-		m_PacingMode.store(PACING_DRAIN, std::memory_order_release);
+		m_PacingMode.store(PACING_ADAPTIVE, std::memory_order_release);
 	}
+
+	// Pick up any on-device tuning overrides for the adaptive controller (no rebuild).
+	loadTuningParams();
 
 	m_FrameCadence.init(m_RefreshRate > 0.0 ? m_RefreshRate : 60.0, static_cast<double>(streamFps));
 
@@ -157,6 +157,55 @@ void Pacer::setPacingMode(int mode) {
 
 int Pacer::getAdaptiveTarget() {
 	return m_AdaptiveTargetPublished.load(std::memory_order_acquire);
+}
+
+// Re-read the PACING_ADAPTIVE controller constants from LocalState\pacing_params.txt so
+// they can be tuned on-device without a rebuild. Format: one "key=value" per line, keys
+// forget / p1 / p2 / p3 / shrink_hold. Missing file or keys keep the current values.
+void Pacer::loadTuningParams() {
+	try {
+		auto folder = Windows::Storage::ApplicationData::Current->LocalFolder;
+		std::wstring path(folder->Path->Data());
+		path += L"\\pacing_params.txt";
+		std::ifstream f(path.c_str());
+		if (!f.is_open()) {
+			Utils::Logf("Pacer: pacing_params.txt not found, keeping current adaptive tuning\n");
+			return;
+		}
+		auto trim = [](std::string &s) {
+			size_t a = s.find_first_not_of(" \t\r\n");
+			size_t b = s.find_last_not_of(" \t\r\n");
+			if (a == std::string::npos) { s.clear(); return; }
+			s = s.substr(a, b - a + 1);
+		};
+		std::string line;
+		while (std::getline(f, line)) {
+			size_t eq = line.find('=');
+			if (eq == std::string::npos) continue;
+			std::string key = line.substr(0, eq), val = line.substr(eq + 1);
+			trim(key); trim(val);
+			if (key.empty() || val.empty() || key[0] == '#') continue;
+			try {
+				if (key == "forget")           m_pStarveForget.store(std::stod(val), std::memory_order_relaxed);
+				else if (key == "p1")          m_pStarveP1.store(std::stod(val), std::memory_order_relaxed);
+				else if (key == "p2")          m_pStarveP2.store(std::stod(val), std::memory_order_relaxed);
+				else if (key == "p3")          m_pStarveP3.store(std::stod(val), std::memory_order_relaxed);
+				else if (key == "shrink_hold") m_pStarveShrinkHoldFrames.store(std::stoi(val), std::memory_order_relaxed);
+			} catch (...) { /* skip a malformed value */ }
+		}
+		Utils::Logf("Pacer adaptive tuning: forget=%.4f p1=%.2f p2=%.2f p3=%.2f shrink_hold=%d\n",
+		            m_pStarveForget.load(), m_pStarveP1.load(), m_pStarveP2.load(),
+		            m_pStarveP3.load(), m_pStarveShrinkHoldFrames.load());
+	} catch (...) {
+		// best effort
+	}
+}
+
+// Clear the CSV pacing trace so the next on-device test starts clean (debug button).
+void Pacer::resetTraceLogs() {
+	if (m_DeviceResources && m_DeviceResources->GetStats()) {
+		m_DeviceResources->GetStats()->resetCsv();
+	}
 }
 
 void Pacer::vsyncHardware() {
@@ -350,13 +399,13 @@ bool Pacer::renderModeImmediate(std::shared_ptr<VideoRenderer> &sceneRenderer) {
 				uint64_t lostNow = m_LostFrameEvents.load(std::memory_order_acquire);
 				double newLost = static_cast<double>(lostNow - m_LastLostSeen);
 				m_LastLostSeen = lostNow;
-				m_StarvePressure = m_StarvePressure * kStarveForget + newLost;
+				m_StarvePressure = m_StarvePressure * m_pStarveForget.load(std::memory_order_relaxed) + newLost;
 
-				// Reactive term: map the decaying starve rate to a buffer depth.
+				// Reactive term: map the decaying loss rate to a buffer depth.
 				int desired = 1;
-				if (m_StarvePressure >= kStarveP1) desired = 2;
-				if (m_StarvePressure >= kStarveP2) desired = 3;
-				if (m_StarvePressure >= kStarveP3) desired = 4;
+				if (m_StarvePressure >= m_pStarveP1.load(std::memory_order_relaxed)) desired = 2;
+				if (m_StarvePressure >= m_pStarveP2.load(std::memory_order_relaxed)) desired = 3;
+				if (m_StarvePressure >= m_pStarveP3.load(std::memory_order_relaxed)) desired = 4;
 
 				// Predictive floor: pre-buffer sustained network arrival jitter (RFC 3550
 				// tail) before it turns into starves.
@@ -373,12 +422,12 @@ bool Pacer::renderModeImmediate(std::shared_ptr<VideoRenderer> &sceneRenderer) {
 				}
 
 				// Grow fast, shrink slow: jump up immediately; step down one only after the
-				// lower demand has held for kStarveShrinkHoldFrames (anti-oscillation).
+				// lower demand has held for m_pStarveShrinkHoldFrames (anti-oscillation).
 				if (desired > m_AdaptiveTarget) {
 					m_AdaptiveTarget = desired;
 					m_ShrinkHoldFrames = 0;
 				} else if (desired < m_AdaptiveTarget) {
-					if (++m_ShrinkHoldFrames >= kStarveShrinkHoldFrames) {
+					if (++m_ShrinkHoldFrames >= m_pStarveShrinkHoldFrames.load(std::memory_order_relaxed)) {
 						--m_AdaptiveTarget;
 						m_ShrinkHoldFrames = 0;
 					}
