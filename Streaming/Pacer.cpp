@@ -347,6 +347,7 @@ bool Pacer::renderModeImmediate(std::shared_ptr<VideoRenderer> &sceneRenderer) {
 
 	if (droppedToCatchUp > 0) {
 		ImGuiPlots::instance().observeFloat(PLOT_DROPPED_PACER, (float) droppedToCatchUp);
+		m_DeviceResources->GetStats()->SubmitCatchupDrop(droppedToCatchUp);
 	}
 
 	if (m_CurrentFrame) {
@@ -400,6 +401,7 @@ bool Pacer::renderModeDisplayLocked(std::shared_ptr<VideoRenderer> &sceneRendere
 			if (i > 0) {
 				// advanceCount was > 1, so this is a dropped frame
 				ImGuiPlots::instance().observeFloat(PLOT_DROPPED_PACER, 1.0);
+				m_DeviceResources->GetStats()->SubmitCatchupDrop(1);
 			}
 			av_frame_free(&m_CurrentFrame);
 		}
@@ -502,13 +504,21 @@ void Pacer::submitFrame(AVFrame *frame) {
 	// PACING_ADAPTIVE to size the buffer target. Cheap; decoder thread only.
 	int64_t now = QpcNow();
 	if (m_HaveLastEnqueue) {
+		double periodMs = m_FrameCadence.streamPeriodMs();
 		double arrivalDeltaMs = QpcToMs(now - m_LastEnqueueQpc);
-		double dev = arrivalDeltaMs - m_FrameCadence.streamPeriodMs();
+		double dev = arrivalDeltaMs - periodMs;
 		if (dev < 0.0) {
 			dev = -dev;
 		}
 		double j = m_ArrivalJitterMs.load(std::memory_order_acquire);
 		m_ArrivalJitterMs.store(j + (dev - j) / 16.0, std::memory_order_release);
+
+		// Producer-side burst signal (debug trace): this frame arrived clustered with the
+		// previous one (< 0.6 period apart), which at target 1 forces a catch-up drop. Measured
+		// here at enqueue by timestamp -> independent of the render buffer depth.
+		if (periodMs > 0.0 && arrivalDeltaMs < 0.6 * periodMs) {
+			m_DeviceResources->GetStats()->SubmitArrivalBurst();
+		}
 	}
 	m_LastEnqueueQpc = now;
 	m_HaveLastEnqueue = true;

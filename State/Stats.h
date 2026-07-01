@@ -26,7 +26,9 @@ typedef struct _VIDEO_STATS {
 	uint32_t renderedFrames;
 	uint32_t totalFrames;
 	uint32_t networkDroppedFrames;
-	uint32_t pacerDroppedFrames;
+	uint32_t pacerDroppedFrames;    // enqueue high-water overflow drops
+	uint32_t pacerCatchupDrops;     // render-loop catch-up drops (drain-to-target / newest)
+	uint32_t arrivalBursts;         // frames arriving clustered (< 0.6 period after previous)
 	uint32_t hitDeadlines;
 	uint32_t missedDeadlines;
 	uint16_t minHostProcessingLatency;
@@ -66,6 +68,8 @@ namespace moonlight_xbox_dx
 		void SubmitVideoBytesAndReassemblyTime(uint32_t length, PDECODE_UNIT decodeUnit, uint32_t droppedFrames);
 		void SubmitDecodeMs(double decodeMs);
 		void SubmitDroppedFrame(int count);
+		void SubmitCatchupDrop(int count);  // render-loop catch-up drops (debug trace)
+		void SubmitArrivalBurst();          // a clustered frame arrival (debug trace)
 		void SubmitAvgQueueSize(float avgQueueSize);
 		void SubmitPacerTime(int64_t pacerTimeQpc);
 		void SubmitPresentPacing(double presentDisplayMs);
