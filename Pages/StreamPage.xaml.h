@@ -65,6 +65,18 @@ namespace moonlight_xbox_dx
 		    }
 	    }
 
+	    // Quick-menu label for the periodic IDR refresh cycle (Off/5s/10s/30s), issue #190
+	    property Platform::String^ PeriodicRefreshLabel {
+		    Platform::String^ get() {
+			    switch (m_periodicRefreshSec) {
+				    case 5: return ref new Platform::String(L"Periodic refresh: 5s");
+				    case 10: return ref new Platform::String(L"Periodic refresh: 10s");
+				    case 30: return ref new Platform::String(L"Periodic refresh: 30s");
+				    default: return ref new Platform::String(L"Periodic refresh: Off");
+			    }
+		    }
+	    }
+
 		void OnBackRequested(Platform::Object^ e, Windows::UI::Core::BackRequestedEventArgs^ args);
 		property ApplicationState^ State {
 			ApplicationState^ get() {
@@ -157,6 +169,10 @@ namespace moonlight_xbox_dx
 		void toggleHDR_WinAltB_Click(Platform::Object^ sender, Windows::UI::Xaml::RoutedEventArgs^ e);
 		void resetDecoder_Click(Platform::Object^ sender, Windows::UI::Xaml::RoutedEventArgs^ e);
 		void toggleFramePacing_Click(Platform::Object^ sender, Windows::UI::Xaml::RoutedEventArgs^ e);
+		void periodicRefresh_Click(Platform::Object^ sender, Windows::UI::Xaml::RoutedEventArgs^ e);
+		void startBitstreamDump_Click(Platform::Object^ sender, Windows::UI::Xaml::RoutedEventArgs^ e);
+		void markBitstreamDump_Click(Platform::Object^ sender, Windows::UI::Xaml::RoutedEventArgs^ e);
+		void stopBitstreamDump_Click(Platform::Object^ sender, Windows::UI::Xaml::RoutedEventArgs^ e);
 		void startLogging_Click(Platform::Object^ sender, Windows::UI::Xaml::RoutedEventArgs^ e);
 		void stopLogging_Click(Platform::Object^ sender, Windows::UI::Xaml::RoutedEventArgs^ e);
 
@@ -168,6 +184,7 @@ namespace moonlight_xbox_dx
         bool m_mouseMode = false;
 	    bool m_showLogs = false;
 	    bool m_showStats = false;
+	    int m_periodicRefreshSec = 0;
 	};
 }
 

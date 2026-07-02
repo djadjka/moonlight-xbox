@@ -44,6 +44,10 @@ StreamPage::StreamPage():
 	swapChainPanel->SizeChanged +=
 		ref new SizeChangedEventHandler(this, &StreamPage::OnSwapChainPanelSizeChanged);
 	m_deviceResources = std::make_shared<DX::DeviceResources>();
+
+	// The decoder singleton keeps the periodic-refresh setting across streams;
+	// pick it up so the quick-menu label matches the actual state
+	m_periodicRefreshSec = FFMpegDecoder::instance().getPeriodicRefreshSec();
 }
 
 
@@ -326,6 +330,39 @@ void StreamPage::toggleFramePacing_Click(Platform::Object^ sender, Windows::UI::
 	// Cycle Immediate -> Display-locked -> Adaptive at runtime. thread safe atomic int
 	int mode = Pacer::instance().getPacingMode();
 	Pacer::instance().setPacingMode((mode + 1) % Pacer::PACING_MODE_COUNT);
+}
+
+// Cycle Off -> 5s -> 10s -> 30s. Requests a host IDR every N seconds so HEVC decoder
+// drift can't accumulate on static content (issue #190). Works with any host encoder.
+void StreamPage::periodicRefresh_Click(Platform::Object^ sender, Windows::UI::Xaml::RoutedEventArgs^ e)
+{
+	switch (m_periodicRefreshSec) {
+		case 0:  m_periodicRefreshSec = 5;  break;
+		case 5:  m_periodicRefreshSec = 10; break;
+		case 10: m_periodicRefreshSec = 30; break;
+		default: m_periodicRefreshSec = 0;  break;
+	}
+	FFMpegDecoder::instance().setPeriodicRefreshSec(m_periodicRefreshSec);
+	OnPropertyChanged("PeriodicRefreshLabel");
+}
+
+// Begin a new bitstream dump (each Start = a fresh timestamped file in LocalState).
+void StreamPage::startBitstreamDump_Click(Platform::Object^ sender, Windows::UI::Xaml::RoutedEventArgs^ e)
+{
+	FFMpegDecoder::instance().startBitstreamDump();
+}
+
+// Record an "artifacts are visible NOW" marker into the running dump's sidecar file,
+// so offline analysis knows exactly which part of the bitstream to inspect.
+void StreamPage::markBitstreamDump_Click(Platform::Object^ sender, Windows::UI::Xaml::RoutedEventArgs^ e)
+{
+	FFMpegDecoder::instance().markBitstreamDump();
+}
+
+// End the current bitstream dump (buffered data is flushed in the background).
+void StreamPage::stopBitstreamDump_Click(Platform::Object^ sender, Windows::UI::Xaml::RoutedEventArgs^ e)
+{
+	FFMpegDecoder::instance().stopBitstreamDump();
 }
 
 // Begin a new CSV pacing trace (each Start = a fresh timestamped file in LocalState).

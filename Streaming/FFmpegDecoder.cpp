@@ -5,6 +5,7 @@
 
 #include <Common\DirectXHelper.h>
 #include <d3d11_1.h>
+#include <fstream>
 #include "Utils.hpp"
 #include "moonlight_xbox_dxMain.h"
 #include <gamingdeviceinformation.h>
@@ -21,6 +22,11 @@ extern "C" {
 using namespace moonlight_xbox_dx;
 
 #define INITIAL_DECODER_BUFFER_SIZE (256 * 1024)
+
+// Bitstream dump: flush to disk every 4 MiB, hard-stop at 2 GiB so a forgotten
+// dump can't fill the console's storage.
+#define DUMP_FLUSH_THRESHOLD (4 * 1024 * 1024)
+#define DUMP_MAX_BYTES (2ULL * 1024 * 1024 * 1024)
 
 static bool ensure_buf_size(unsigned char **buf, int *buf_size, int required_size)
 {
@@ -100,6 +106,8 @@ namespace moonlight_xbox_dx {
 		this->m_LastFrameNumber = 0;
 		this->ffmpeg_buffer_size = 0;
 		this->m_StreamEpochQpc = 0;
+		this->m_LastPeriodicIdrQpc = 0;
+		this->m_LastCorruptReportQpc = 0;
 
 
 #if LIBAVCODEC_VERSION_INT < AV_VERSION_INT(58,10,100)
@@ -178,6 +186,9 @@ namespace moonlight_xbox_dx {
 	}
 
 	void FFMpegDecoder::Cleanup() {
+		// Flush and close a still-running bitstream dump before the stream goes away
+		stopBitstreamDump();
+
 		avcodec_free_context(&decoder_ctx);
 		if (ffmpeg_buffer != NULL) {
 			free(ffmpeg_buffer);
@@ -214,8 +225,26 @@ namespace moonlight_xbox_dx {
 		PLENTRY entry = decodeUnit->bufferList;
 		int length = 0;
 		QueryPerformanceCounter(&decodeStart);
+		decodeEnd.QuadPart = 0; // only set when a frame actually comes out of the decoder
 
 		if (m_StreamEpochQpc == 0) m_StreamEpochQpc = decodeStart.QuadPart;
+
+		// Periodic stream refresh: re-anchor the stream with a host IDR every N seconds so
+		// decoder drift can't accumulate on static content (issue #190). Any IDR that
+		// arrives on its own (host-side refresh, loss recovery) restarts the interval,
+		// so this acts as a watchdog rather than a fixed-rate requester.
+		int refreshSec = m_PeriodicRefreshSec.load(std::memory_order_acquire);
+		if (refreshSec > 0) {
+			if (m_LastPeriodicIdrQpc == 0 || decodeUnit->frameType == FRAME_TYPE_IDR) {
+				m_LastPeriodicIdrQpc = decodeStart.QuadPart;
+			} else if (QpcToMs(decodeStart.QuadPart - m_LastPeriodicIdrQpc) >= refreshSec * 1000.0) {
+				m_LastPeriodicIdrQpc = decodeStart.QuadPart;
+				LiRequestIdrFrame();
+				Utils::Log("Periodic stream refresh: requested IDR\n");
+			}
+		} else {
+			m_LastPeriodicIdrQpc = 0;
+		}
 
 		if (!ensure_buf_size(&ffmpeg_buffer, &ffmpeg_buffer_size, decodeUnit->fullLength + AV_INPUT_BUFFER_PADDING_SIZE)) {
 			Utils::Logf("Couldn't realloc ffmpeg_buffer\n");
@@ -228,6 +257,11 @@ namespace moonlight_xbox_dx {
 		    entry = entry->next;
 	    }
 		memset(ffmpeg_buffer + length, 0, AV_INPUT_BUFFER_PADDING_SIZE);
+
+		// Diagnostic: capture the exact Annex-B bytes we are about to feed the decoder
+		if (m_DumpEnabled.load(std::memory_order_acquire)) {
+			appendBitstreamDump(ffmpeg_buffer, length);
+		}
 
 		// Detect breaks in the frame sequence indicating dropped packets
 		uint32_t droppedFramesNetwork = 0;
@@ -265,6 +299,8 @@ namespace moonlight_xbox_dx {
 			return DR_NEED_IDR;
 		}
 
+		bool sawCorruptFrame = false;
+
 		while (err >= 0) {
 			AVFrame* frame = av_frame_alloc();
 			err = avcodec_receive_frame(decoder_ctx, frame);
@@ -278,6 +314,19 @@ namespace moonlight_xbox_dx {
 				Utils::Logf("avcodec_receive_frame failed: %s\n", ffmpegError);
 				av_frame_free(&frame);
 				return DR_NEED_IDR;
+			}
+
+			// The hardware decoder normally conceals decode problems silently; surface them
+			// and re-anchor with an IDR instead of letting the corruption linger on screen.
+			// Rate-limited to once per second so a decoder that (wrongly) flags every frame
+			// can't trigger an IDR storm that would tank the stream.
+			if (frame->decode_error_flags != 0 || (frame->flags & AV_FRAME_FLAG_CORRUPT)) {
+				if (m_LastCorruptReportQpc == 0 || QpcToMs(decodeStart.QuadPart - m_LastCorruptReportQpc) >= 1000.0) {
+					m_LastCorruptReportQpc = decodeStart.QuadPart;
+					Utils::Logf("Decoder flagged corrupt output (decode_error_flags=0x%x), requesting IDR\n",
+						frame->decode_error_flags);
+					sawCorruptFrame = true;
+				}
 			}
 
 			// Capture a frame timestamp to measuring pacing delay
@@ -320,7 +369,135 @@ namespace moonlight_xbox_dx {
 		// 	}
 		// }
 
-		return DR_OK;
+		return sawCorruptFrame ? DR_NEED_IDR : DR_OK;
+	}
+
+	int FFMpegDecoder::getPeriodicRefreshSec() {
+		return m_PeriodicRefreshSec.load(std::memory_order_acquire);
+	}
+
+	void FFMpegDecoder::setPeriodicRefreshSec(int seconds) {
+		m_PeriodicRefreshSec.store(seconds, std::memory_order_release);
+		Utils::Logf("Periodic stream refresh set to %ds\n", seconds);
+	}
+
+	// Begin a fresh bitstream dump. Each Start writes to a NEW timestamped file in LocalState
+	// (pull it via the Device Portal). We immediately ask the host for an IDR so the dump
+	// begins with parameter sets + a keyframe and is decodable offline from the first frame.
+	void FFMpegDecoder::startBitstreamDump() {
+		std::lock_guard<std::mutex> lock(m_DumpMutex);
+		if (m_DumpEnabled.load(std::memory_order_acquire)) {
+			return;
+		}
+		SYSTEMTIME st;
+		GetLocalTime(&st);
+		wchar_t name[80];
+		swprintf(name, 80, L"bitstream_%04d%02d%02d_%02d%02d%02d.%s",
+		         st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute, st.wSecond,
+		         (videoFormat & VIDEO_FORMAT_MASK_H264) ? L"h264" : L"h265");
+		try {
+			auto folder = Windows::Storage::ApplicationData::Current->LocalFolder;
+			m_DumpPath = std::wstring(folder->Path->Data()) + L"\\" + name;
+			std::ofstream f(m_DumpPath.c_str(), std::ios::trunc | std::ios::binary);
+			if (!f.is_open()) {
+				m_DumpPath.clear();
+				return;
+			}
+		} catch (...) {
+			m_DumpPath.clear();
+			return;
+		}
+		m_DumpBytesTotal = 0;
+		m_DumpMarkerCount = 0;
+		m_DumpBuffer.clear();
+		m_DumpBuffer.reserve(DUMP_FLUSH_THRESHOLD + INITIAL_DECODER_BUFFER_SIZE);
+		m_DumpEnabled.store(true, std::memory_order_release);
+		LiRequestIdrFrame();
+		Utils::Log("Bitstream dump started\n");
+	}
+
+	// Record an "artifacts are visible NOW" marker: appends the current dump byte offset
+	// and frame number to a sidecar <dump>.markers.txt, so offline analysis knows exactly
+	// which stretch of the bitstream to render without needing precisely timed photos.
+	// Called from the UI thread; the tiny synchronous append is fine there.
+	void FFMpegDecoder::markBitstreamDump() {
+		std::lock_guard<std::mutex> lock(m_DumpMutex);
+		if (m_DumpPath.empty()) {
+			Utils::Log("Dump marker ignored: no bitstream dump running\n");
+			return;
+		}
+		m_DumpMarkerCount++;
+		SYSTEMTIME st;
+		GetLocalTime(&st);
+		char line[160];
+		snprintf(line, sizeof(line), "marker %d local_time=%02d:%02d:%02d byte_offset=%llu last_frame=%d stream_ms=%.0f\n",
+		         m_DumpMarkerCount, st.wHour, st.wMinute, st.wSecond,
+		         (unsigned long long)m_DumpBytesTotal, m_LastFrameNumber,
+		         QpcToMs(QpcNow() - m_StreamEpochQpc));
+		try {
+			std::ofstream f((m_DumpPath + L".markers.txt").c_str(), std::ios::app);
+			if (f.is_open()) {
+				f << line;
+			}
+		} catch (...) {
+			// best effort
+		}
+		Utils::Logf("Dump marker %d recorded at byte %llu\n", m_DumpMarkerCount, (unsigned long long)m_DumpBytesTotal);
+	}
+
+	// End the current dump: flush whatever is buffered and forget the file.
+	void FFMpegDecoder::stopBitstreamDump() {
+		std::lock_guard<std::mutex> lock(m_DumpMutex);
+		if (!m_DumpEnabled.load(std::memory_order_acquire) && m_DumpPath.empty()) {
+			return;
+		}
+		m_DumpEnabled.store(false, std::memory_order_release);
+		scheduleDumpFlushLocked();
+		m_DumpPath.clear();
+		Utils::Logf("Bitstream dump stopped (%llu bytes)\n", (unsigned long long)m_DumpBytesTotal);
+	}
+
+	// Called on the decode thread for every submitted decode unit while dumping.
+	// Only pays for a memcpy; disk writes happen on the background write chain.
+	void FFMpegDecoder::appendBitstreamDump(const unsigned char *data, int size) {
+		std::lock_guard<std::mutex> lock(m_DumpMutex);
+		if (m_DumpPath.empty() || size <= 0) {
+			return;
+		}
+		if (m_DumpBytesTotal + (uint64_t)size > DUMP_MAX_BYTES) {
+			m_DumpEnabled.store(false, std::memory_order_release);
+			scheduleDumpFlushLocked();
+			m_DumpPath.clear();
+			Utils::Log("Bitstream dump reached the 2 GiB cap, stopping\n");
+			return;
+		}
+		m_DumpBuffer.insert(m_DumpBuffer.end(), data, data + size);
+		m_DumpBytesTotal += (uint64_t)size;
+		if (m_DumpBuffer.size() >= DUMP_FLUSH_THRESHOLD) {
+			scheduleDumpFlushLocked();
+		}
+	}
+
+	// Hand the accumulated chunk to a background task. Chained on the previous write so
+	// chunks land in the file in order; same best-effort ofstream append as the CSV logger.
+	void FFMpegDecoder::scheduleDumpFlushLocked() {
+		if (m_DumpBuffer.empty() || m_DumpPath.empty()) {
+			return;
+		}
+		auto chunk = std::make_shared<std::vector<unsigned char>>(std::move(m_DumpBuffer));
+		m_DumpBuffer = std::vector<unsigned char>();
+		m_DumpBuffer.reserve(DUMP_FLUSH_THRESHOLD + INITIAL_DECODER_BUFFER_SIZE);
+		std::wstring path = m_DumpPath;
+		m_DumpWriteChain = m_DumpWriteChain.then([path, chunk]() {
+			try {
+				std::ofstream f(path.c_str(), std::ios::app | std::ios::binary);
+				if (f.is_open()) {
+					f.write((const char *)chunk->data(), chunk->size());
+				}
+			} catch (...) {
+				// best effort
+			}
+		});
 	}
 
 	//Helpers

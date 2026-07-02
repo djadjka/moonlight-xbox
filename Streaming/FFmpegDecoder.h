@@ -2,7 +2,10 @@
 
 #include <atomic>
 #include <mutex>
+#include <ppltasks.h>
 #include <queue>
+#include <string>
+#include <vector>
 #include "../Common/StepTimer.h"
 #include "Pacer.h"
 #include "Utils.hpp"
@@ -39,6 +42,17 @@ class FFMpegDecoder {
 	int videoFormat, width, height, fps;
 	std::recursive_mutex m_mutex;
 
+	// Periodic stream refresh (quick menu): request an IDR every N seconds so decoder
+	// drift can't accumulate on static content (issue #190). 0 = off.
+	int getPeriodicRefreshSec();
+	void setPeriodicRefreshSec(int seconds);
+
+	// Bitstream dump diagnostic (quick menu): append every submitted Annex-B decode unit
+	// to a timestamped file in LocalState, retrievable via the Xbox Device Portal.
+	void startBitstreamDump();
+	void stopBitstreamDump();
+	void markBitstreamDump();  // record an "artifacts visible now" marker in a sidecar file
+
 	// locking helper
 	class LockGuard {
 	  public:
@@ -65,6 +79,9 @@ class FFMpegDecoder {
 	FFMpegDecoder(const FFMpegDecoder &) = delete;
 	FFMpegDecoder &operator=(const FFMpegDecoder &) = delete;
 
+	void appendBitstreamDump(const unsigned char *data, int size);
+	void scheduleDumpFlushLocked(); // must be called with m_DumpMutex held
+
 	const AVCodec *decoder;
 	AVCodecContext *decoder_ctx;
 	AVHWDeviceContext *device_ctx;
@@ -74,5 +91,21 @@ class FFMpegDecoder {
 	std::shared_ptr<DX::DeviceResources> m_deviceResources;
 	int m_LastFrameNumber;
 	int64_t m_StreamEpochQpc;
+
+	// Periodic stream refresh state; m_LastPeriodicIdrQpc is touched only on the decode thread
+	std::atomic<int> m_PeriodicRefreshSec{0};
+	int64_t m_LastPeriodicIdrQpc = 0;
+	int64_t m_LastCorruptReportQpc = 0;  // rate-limits corrupt-frame logging/IDR requests
+
+	// Bitstream dump state. The decode thread appends into m_DumpBuffer under m_DumpMutex;
+	// full chunks are handed to m_DumpWriteChain (ordered background writes) so the decode
+	// thread never blocks on disk I/O.
+	std::atomic<bool> m_DumpEnabled{false};
+	std::mutex m_DumpMutex;
+	std::wstring m_DumpPath;
+	std::vector<unsigned char> m_DumpBuffer;
+	uint64_t m_DumpBytesTotal = 0;
+	int m_DumpMarkerCount = 0;
+	concurrency::task<void> m_DumpWriteChain = concurrency::task_from_result();
 };
 } // namespace moonlight_xbox_dx
