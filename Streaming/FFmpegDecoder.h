@@ -81,6 +81,7 @@ class FFMpegDecoder {
 
 	void appendBitstreamDump(const unsigned char *data, int size);
 	void scheduleDumpFlushLocked(); // must be called with m_DumpMutex held
+	void captureDecodedFrameSnapshot(AVFrame *hwFrame, int frameNumber); // decode thread only
 
 	const AVCodec *decoder;
 	AVCodecContext *decoder_ctx;
@@ -107,5 +108,10 @@ class FFMpegDecoder {
 	uint64_t m_DumpBytesTotal = 0;
 	int m_DumpMarkerCount = 0;
 	concurrency::task<void> m_DumpWriteChain = concurrency::task_from_result();
+
+	// Decoded-frame snapshot burst armed by markBitstreamDump; m_SnapshotCaptured is
+	// touched only on the decode thread
+	std::atomic<int> m_SnapshotRemaining{0};
+	int m_SnapshotCaptured = 0;
 };
 } // namespace moonlight_xbox_dx

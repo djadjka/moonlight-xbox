@@ -28,6 +28,12 @@ using namespace moonlight_xbox_dx;
 #define DUMP_FLUSH_THRESHOLD (4 * 1024 * 1024)
 #define DUMP_MAX_BYTES (2ULL * 1024 * 1024 * 1024)
 
+// Decoded-frame snapshots: each "Mark" press captures this many CONSECUTIVE decoded
+// frames (consecutive so offline analysis can attribute the error added in a single
+// frame to the coding tools of that exact frame), capped per session.
+#define SNAPSHOT_BURST_FRAMES 4
+#define SNAPSHOT_MAX_FRAMES 40
+
 static bool ensure_buf_size(unsigned char **buf, int *buf_size, int required_size)
 {
 	if (*buf_size >= required_size)
@@ -346,6 +352,15 @@ namespace moonlight_xbox_dx {
 				decodeUnit->frameNumber - decoder_ctx->frame_num,
 				QpcToMs(decodeEnd.QuadPart - decodeStart.QuadPart));
 
+			// Diagnostic: after a "Mark" press, capture the hardware decoder's ACTUAL output
+			// for a few consecutive frames so it can be compared offline against a reference
+			// decode of the same bitstream (isolates decoder drift and fingerprints the
+			// coding tool responsible). Must happen before Pacer takes ownership.
+			if (m_SnapshotRemaining.load(std::memory_order_acquire) > 0) {
+				m_SnapshotRemaining.fetch_sub(1, std::memory_order_acq_rel);
+				captureDecodedFrameSnapshot(frame, decodeUnit->frameNumber);
+			}
+
 			// Queue the frame for rendering. frame is now owned by Pacer.
 			Pacer::instance().submitFrame(frame);
 
@@ -409,6 +424,7 @@ namespace moonlight_xbox_dx {
 		}
 		m_DumpBytesTotal = 0;
 		m_DumpMarkerCount = 0;
+		m_SnapshotCaptured = 0;
 		m_DumpBuffer.clear();
 		m_DumpBuffer.reserve(DUMP_FLUSH_THRESHOLD + INITIAL_DECODER_BUFFER_SIZE);
 		m_DumpEnabled.store(true, std::memory_order_release);
@@ -442,7 +458,86 @@ namespace moonlight_xbox_dx {
 		} catch (...) {
 			// best effort
 		}
+		// Arm a burst of decoded-frame snapshots for the frames that follow this marker
+		if (m_DumpEnabled.load(std::memory_order_acquire)) {
+			m_SnapshotRemaining.store(SNAPSHOT_BURST_FRAMES, std::memory_order_release);
+		}
 		Utils::Logf("Dump marker %d recorded at byte %llu\n", m_DumpMarkerCount, (unsigned long long)m_DumpBytesTotal);
+	}
+
+	// Transfer one decoded frame from the GPU and append it (small header + packed
+	// Y/UV planes) to <dump>.frames.bin through the background write chain. ~25 MB
+	// per 4K HDR frame, so a burst briefly stalls the decode thread; acceptable for
+	// a manually-triggered diagnostic. Called on the decode thread only.
+	void FFMpegDecoder::captureDecodedFrameSnapshot(AVFrame *hwFrame, int frameNumber) {
+		if (m_SnapshotCaptured >= SNAPSHOT_MAX_FRAMES) {
+			return;
+		}
+		AVFrame *sw = av_frame_alloc();
+		if (sw == NULL) {
+			return;
+		}
+		int err = av_hwframe_transfer_data(sw, hwFrame, 0);
+		if (err != 0) {
+			char errorstring[512];
+			av_strerror(err, errorstring, sizeof(errorstring));
+			Utils::Logf("Snapshot: hwframe transfer failed: %s\n", errorstring);
+			av_frame_free(&sw);
+			return;
+		}
+		int width = sw->width, height = sw->height, format = sw->format;
+		// NV12 (8-bit) / P010 (10-bit) layout: full-res Y plane + half-height interleaved UV
+		size_t bps = (format == AV_PIX_FMT_P010LE) ? 2 : 1;
+		size_t yRow = (size_t)width * bps;
+		size_t uvRows = (size_t)height / 2;
+		uint64_t dumpBytes;
+		{
+			std::lock_guard<std::mutex> lock(m_DumpMutex);
+			dumpBytes = m_DumpBytesTotal;
+		}
+		// 48-byte little-endian header so the offline tool can find and identify each frame
+		uint32_t header[12] = {0};
+		memcpy(&header[0], "MXFR", 4);
+		header[1] = 1;  // version
+		header[2] = (uint32_t)frameNumber;
+		header[3] = (uint32_t)width;
+		header[4] = (uint32_t)height;
+		header[5] = (uint32_t)format;  // AVPixelFormat enum value
+		memcpy(&header[6], &dumpBytes, 8);
+		header[8] = (uint32_t)(yRow * height + yRow * uvRows);  // payload size
+		std::vector<unsigned char> chunk;
+		chunk.reserve(sizeof(header) + yRow * height + yRow * uvRows);
+		chunk.insert(chunk.end(), (unsigned char *)header, (unsigned char *)header + sizeof(header));
+		for (int r = 0; r < height; r++) {
+			const unsigned char *row = sw->data[0] + (size_t)r * sw->linesize[0];
+			chunk.insert(chunk.end(), row, row + yRow);
+		}
+		for (size_t r = 0; r < uvRows; r++) {
+			const unsigned char *row = sw->data[1] + r * sw->linesize[1];
+			chunk.insert(chunk.end(), row, row + yRow);
+		}
+		av_frame_free(&sw);
+		{
+			std::lock_guard<std::mutex> lock(m_DumpMutex);
+			if (m_DumpPath.empty()) {
+				return;
+			}
+			auto data = std::make_shared<std::vector<unsigned char>>(std::move(chunk));
+			std::wstring path = m_DumpPath + L".frames.bin";
+			m_DumpWriteChain = m_DumpWriteChain.then([path, data]() {
+				try {
+					std::ofstream f(path.c_str(), std::ios::app | std::ios::binary);
+					if (f.is_open()) {
+						f.write((const char *)data->data(), data->size());
+					}
+				} catch (...) {
+					// best effort
+				}
+			});
+		}
+		m_SnapshotCaptured++;
+		Utils::Logf("Snapshot: captured decoded frame %d (%dx%d fmt %d, %d/%d)\n",
+		            frameNumber, width, height, format, m_SnapshotCaptured, SNAPSHOT_MAX_FRAMES);
 	}
 
 	// End the current dump: flush whatever is buffered and forget the file.
@@ -452,6 +547,7 @@ namespace moonlight_xbox_dx {
 			return;
 		}
 		m_DumpEnabled.store(false, std::memory_order_release);
+		m_SnapshotRemaining.store(0, std::memory_order_release);
 		scheduleDumpFlushLocked();
 		m_DumpPath.clear();
 		Utils::Logf("Bitstream dump stopped (%llu bytes)\n", (unsigned long long)m_DumpBytesTotal);
