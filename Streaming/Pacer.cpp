@@ -46,11 +46,13 @@ constexpr double kPhaseMarginCapMs = 25.0;
 
 // Burst-score signal: each clustered arrival adds 1, the score decays per frame. Validated
 // on-device: the "heavy scene" runs 1-2 starve+catch-up cycles/s = 2-5 bursts/s (score ~4),
-// a clean scene has none. Half-life ~2.3 s @120fps. Threshold 1.5 means a single isolated
-// burst never grows the buffer (needs >= 2 within ~2.5 s); the heavy scene trips within a
-// second or two, and it reclaims after ~3-4 burst-free seconds.
+// a clean scene has none. Half-life ~2.3 s @120fps. Enter at 1.5 so a single isolated burst
+// never grows the buffer (needs >= 2 within ~2.5 s); release only below 0.5 — a real-gameplay
+// episode showed the score wandering around a single threshold (1.0-1.9 for ~15 s), flapping
+// the target 1<->2 seven times and manufacturing a reclaim-drop on every downswing.
 constexpr double kBurstForget = 0.9975;
-constexpr double kBurstDepthThreshold = 1.5;
+constexpr double kBurstEnterScore = 1.5;
+constexpr double kBurstReleaseScore = 0.5;
 
 using steady_clock = std::chrono::steady_clock;
 using namespace moonlight_xbox_dx;
@@ -126,6 +128,8 @@ void Pacer::init(const std::shared_ptr<DX::DeviceResources> &res, int streamFps,
 	m_PhaseMarginMinMs.store(-1.0, std::memory_order_relaxed);
 	m_ArrivalBurstScore.store(0.0, std::memory_order_relaxed);
 	m_AdaptiveTargetPublished.store(1, std::memory_order_relaxed);
+	m_BurstLatched = false;
+	m_EffectiveTarget = 1;
 	m_LastHwm = FRAME_QUEUE_HIGH;
 
 	// Start FrameQueue so it's ready to receive new frames
@@ -319,8 +323,15 @@ bool Pacer::renderModeImmediate(std::shared_ptr<VideoRenderer> &sceneRenderer) {
 				// at the present deadline (starve + catch-up pairs at depth 1, the validated
 				// "heavy scene" judder). One buffered frame absorbs the pair completely: the
 				// starved slot presents the spare, the burst refills it, nothing is dropped.
-				// Bursts persist regardless of depth, so this reclaims only when the phase heals.
-				int burstDepth = m_ArrivalBurstScore.load(std::memory_order_relaxed) >= kBurstDepthThreshold ? 2 : 1;
+				// Bursts persist regardless of depth, so this reclaims only when the phase
+				// heals. Enter/release hysteresis keeps one episode = one solid depth-2 window.
+				double burstScore = m_ArrivalBurstScore.load(std::memory_order_relaxed);
+				if (burstScore >= kBurstEnterScore) {
+					m_BurstLatched = true;
+				} else if (burstScore < kBurstReleaseScore) {
+					m_BurstLatched = false;
+				}
+				int burstDepth = m_BurstLatched ? 2 : 1;
 
 				target = jitterDepth > decodeDepth ? jitterDepth : decodeDepth;
 				if (burstDepth > target) {
@@ -331,6 +342,16 @@ bool Pacer::renderModeImmediate(std::shared_ptr<VideoRenderer> &sceneRenderer) {
 				}
 			}
 		}
+		// Instant grow, lazy shrink: raising the target takes effect immediately (absorb the
+		// trouble NOW), but lowering it never drops a frame — the effective target steps down
+		// only at a natural drain moment (queue empty), which the 119.88-in-120Hz cadence
+		// guarantees within seconds. Measured motivation: reclaim-drops during a flapping
+		// episode were themselves the visible skips.
+		if (target >= m_EffectiveTarget) {
+			m_EffectiveTarget = target;
+		}
+		const int desiredTarget = target;
+		target = m_EffectiveTarget;
 		m_AdaptiveTargetPublished.store(target, std::memory_order_relaxed);
 		// Let the queue hold `target` frames plus one arriving, so a grown buffer retains the
 		// NEWEST frames instead of the high-water alternate-drop discarding new arrivals. Only
@@ -354,7 +375,13 @@ bool Pacer::renderModeImmediate(std::shared_ptr<VideoRenderer> &sceneRenderer) {
 		}
 		newFrame = FrameQueue::instance().dequeue();
 		if (!newFrame) {
+			// Starve: the queue is empty, so shrinking the effective target is free here
+			m_EffectiveTarget = desiredTarget;
 			return false; // no frame, don't Present()
+		}
+		if (FrameQueue::instance().count() == 0) {
+			// Drained to the last frame: same free-shrink opportunity
+			m_EffectiveTarget = desiredTarget;
 		}
 	} else {
 		// PACING_IMMEDIATE: lowest latency. Render the NEWEST available frame and discard

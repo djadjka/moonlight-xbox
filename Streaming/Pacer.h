@@ -97,6 +97,11 @@ class Pacer {
 	// which is what makes it oscillation-proof, unlike render-side starve/drop counts.
 	std::atomic<double> m_ArrivalBurstScore{0.0};
 	int m_LastHwm = 3;  // render thread: last high-water set (== FRAME_QUEUE_HIGH; avoids re-locking)
+	// Render-thread controller state: burst-signal hysteresis latch (enter 1.5 / release 0.5)
+	// and the lazily-shrunk effective target (grow instant, shrink only at drain moments so
+	// reclaim never has to drop a frame).
+	bool m_BurstLatched = false;
+	int m_EffectiveTarget = 1;
 	std::atomic<int> m_AdaptiveTargetPublished{1};  // current target, for the overlay/CSV
 
 	FrameCadence m_FrameCadence;
