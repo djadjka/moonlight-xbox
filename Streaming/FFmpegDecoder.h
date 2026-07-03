@@ -107,6 +107,7 @@ class FFMpegDecoder {
 	std::vector<unsigned char> m_DumpBuffer;
 	uint64_t m_DumpBytesTotal = 0;
 	int m_DumpMarkerCount = 0;
+	int m_DumpAUCount = 0;  ///< AUs appended since dump start; drives early auto-sampling (decode thread only)
 	concurrency::task<void> m_DumpWriteChain = concurrency::task_from_result();
 
 	// Decoded-frame snapshot burst armed by markBitstreamDump; m_SnapshotCaptured is

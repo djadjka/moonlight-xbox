@@ -32,7 +32,15 @@ using namespace moonlight_xbox_dx;
 // frames (consecutive so offline analysis can attribute the error added in a single
 // frame to the coding tools of that exact frame), capped per session.
 #define SNAPSHOT_BURST_FRAMES 4
-#define SNAPSHOT_MAX_FRAMES 40
+#define SNAPSHOT_MAX_FRAMES 128
+
+// Auto-sampling right after a dump starts: capture a PAIR of consecutive decoded
+// frames every second for the first 30 s. Decoder drift right after the dump's IDR
+// is the only place the PRIMAL non-bit-exact operation shows uncontaminated (later
+// the loop filters legitimately diverge because they run on already-drifted state).
+#define DUMP_AUTOSAMPLE_WINDOW 3600
+#define DUMP_AUTOSAMPLE_PERIOD 120
+#define DUMP_AUTOSAMPLE_PAIR 2
 
 static bool ensure_buf_size(unsigned char **buf, int *buf_size, int required_size)
 {
@@ -267,6 +275,7 @@ namespace moonlight_xbox_dx {
 		// Diagnostic: capture the exact Annex-B bytes we are about to feed the decoder
 		if (m_DumpEnabled.load(std::memory_order_acquire)) {
 			appendBitstreamDump(ffmpeg_buffer, length);
+			m_DumpAUCount++;
 		}
 
 		// Detect breaks in the frame sequence indicating dropped packets
@@ -352,12 +361,21 @@ namespace moonlight_xbox_dx {
 				decodeUnit->frameNumber - decoder_ctx->frame_num,
 				QpcToMs(decodeEnd.QuadPart - decodeStart.QuadPart));
 
-			// Diagnostic: after a "Mark" press, capture the hardware decoder's ACTUAL output
-			// for a few consecutive frames so it can be compared offline against a reference
-			// decode of the same bitstream (isolates decoder drift and fingerprints the
-			// coding tool responsible). Must happen before Pacer takes ownership.
+			// Diagnostic: capture the hardware decoder's ACTUAL output for offline comparison
+			// against a reference decode of the same bitstream. Two triggers: a "Mark" press
+			// (burst of consecutive frames), or the auto-sampling window right after a dump
+			// starts (frame pairs each second while the DPB is still near-pristine). Must
+			// happen before Pacer takes ownership.
+			bool wantSnapshot = false;
 			if (m_SnapshotRemaining.load(std::memory_order_acquire) > 0) {
 				m_SnapshotRemaining.fetch_sub(1, std::memory_order_acq_rel);
+				wantSnapshot = true;
+			} else if (m_DumpEnabled.load(std::memory_order_acquire) &&
+			           m_DumpAUCount <= DUMP_AUTOSAMPLE_WINDOW &&
+			           (m_DumpAUCount - 1) % DUMP_AUTOSAMPLE_PERIOD < DUMP_AUTOSAMPLE_PAIR) {
+				wantSnapshot = true;
+			}
+			if (wantSnapshot) {
 				captureDecodedFrameSnapshot(frame, decodeUnit->frameNumber);
 			}
 
@@ -424,6 +442,7 @@ namespace moonlight_xbox_dx {
 		}
 		m_DumpBytesTotal = 0;
 		m_DumpMarkerCount = 0;
+		m_DumpAUCount = 0;
 		m_SnapshotCaptured = 0;
 		m_DumpBuffer.clear();
 		m_DumpBuffer.reserve(DUMP_FLUSH_THRESHOLD + INITIAL_DECODER_BUFFER_SIZE);
