@@ -4,6 +4,7 @@
 #include "Pacer.h"
 #include <algorithm>
 #include <chrono>
+#include <cmath>
 #include <thread>
 #include <windows.h>
 #include "../Plot/ImGuiPlots.h"
@@ -34,23 +35,31 @@
 constexpr int FRAME_QUEUE_LOW = 1;
 constexpr int FRAME_QUEUE_HIGH = 3;
 
-// PACING_ADAPTIVE decode-time signal: per-frame decode time decays by this factor each frame
-// (~0.6 s half-life @120fps), so a complex scene buffers and a clean scene reclaims latency.
-constexpr double kDecodeForget = 0.99;
+// All signal time constants are WALL-CLOCK-based (half-lives in ms, decayed by the actual
+// elapsed time between updates), NOT per-frame factors, so the controller behaves identically
+// at 30/60/90/120 fps. (Per-frame factors would stretch every reaction time 2x at 60 fps and
+// 4x at 30 fps.) Values were validated on-device at 120 fps.
 
-// Phase-margin measurement: the decaying MIN relaxes upward by this much per arriving frame
-// (~6 ms/s @120fps -> forgets a one-off close call in ~1.5 s but tracks a persistent
-// low-margin regime). Clamp keeps the relaxed value in a sane display-period range.
-constexpr double kPhaseRelaxMsPerFrame = 0.05;
+// PACING_ADAPTIVE decode-time signal: decaying max of per-frame decode time, so a complex
+// scene buffers and a clean scene reclaims latency. 600 ms half-life (== the validated
+// 0.99-per-frame factor at 120 fps).
+constexpr double kDecodeHalfLifeMs = 600.0;
+
+// Phase-margin measurement: the decaying MIN relaxes upward at this rate (forgets a one-off
+// close call in ~1.5 s but tracks a persistent low-margin regime). Clamp keeps the relaxed
+// value in a sane display-period range.
+constexpr double kPhaseRelaxMsPerSecond = 6.0;
 constexpr double kPhaseMarginCapMs = 25.0;
 
-// Burst-score signal: each clustered arrival adds 1, the score decays per frame. Validated
-// on-device: the "heavy scene" runs 1-2 starve+catch-up cycles/s = 2-5 bursts/s (score ~4),
-// a clean scene has none. Half-life ~2.3 s @120fps. Enter at 1.5 so a single isolated burst
-// never grows the buffer (needs >= 2 within ~2.5 s); release only below 0.5 — a real-gameplay
-// episode showed the score wandering around a single threshold (1.0-1.9 for ~15 s), flapping
-// the target 1<->2 seven times and manufacturing a reclaim-drop on every downswing.
-constexpr double kBurstForget = 0.9975;
+// Burst-score signal: each clustered arrival adds 1, the score decays with a 2.3 s half-life
+// (== the validated 0.9975-per-frame factor at 120 fps; steady-state score ~3.3x the bursts/s
+// rate). Validated on-device: the "heavy scene" runs 1-2 starve+catch-up cycles/s = 2-5
+// bursts/s (score ~4), a clean scene has none. Enter at 1.5 so a single isolated burst never
+// grows the buffer (needs >= 2 within a couple of seconds); release only below 0.5 — a
+// real-gameplay episode showed the score wandering around a single threshold (1.0-1.9 for
+// ~15 s), flapping the target 1<->2 seven times and manufacturing a reclaim-drop on every
+// downswing.
+constexpr double kBurstHalfLifeMs = 2300.0;
 constexpr double kBurstEnterScore = 1.5;
 constexpr double kBurstReleaseScore = 0.5;
 
@@ -132,6 +141,7 @@ void Pacer::init(const std::shared_ptr<DX::DeviceResources> &res, int streamFps,
 
 	// Reset the PACING_ADAPTIVE signals so a reconnect starts at the low-latency floor.
 	m_RecentMaxDecodeMs.store(0.0, std::memory_order_relaxed);
+	m_LastDecodeObsQpc = 0;
 	m_PhaseMarginMinMs.store(-1.0, std::memory_order_relaxed);
 	m_ArrivalBurstScore.store(0.0, std::memory_order_relaxed);
 	m_AdaptiveTargetPublished.store(1, std::memory_order_relaxed);
@@ -537,10 +547,16 @@ int64_t Pacer::getCurrentFramePts() {
 // called by decoder thread
 // Per-frame decode time, fed by the decoder thread for NON-IDR frames only (an IDR is large
 // and slow by nature; including it would falsely pin the buffer). Keeps a decaying max so a
-// complex scene raises the signal and a clean scene reclaims latency. Single writer (decoder
+// complex scene raises the signal and a clean scene reclaims latency; the decay uses the
+// actual elapsed time between observations, so it's fps-independent. Single writer (decoder
 // thread); the render thread only reads m_RecentMaxDecodeMs, so the RMW here is race-free.
 void Pacer::observeDecodeMs(double decodeMs) {
-	double cur = m_RecentMaxDecodeMs.load(std::memory_order_relaxed) * kDecodeForget;
+	int64_t now = QpcNow();
+	double cur = m_RecentMaxDecodeMs.load(std::memory_order_relaxed);
+	if (m_LastDecodeObsQpc != 0) {
+		cur *= exp2(-QpcToMs(now - m_LastDecodeObsQpc) / kDecodeHalfLifeMs);
+	}
+	m_LastDecodeObsQpc = now;
 	if (decodeMs > cur) {
 		cur = decodeMs;
 	}
@@ -598,9 +614,10 @@ void Pacer::submitFrame(AVFrame *frame) {
 	// inter-arrival time from the expected frame period: J += (|D| - J)/16. Read by
 	// PACING_ADAPTIVE to size the buffer target. Cheap; decoder thread only.
 	int64_t now = QpcNow();
+	double arrivalDeltaMs = 0.0;
 	if (m_HaveLastEnqueue) {
 		double periodMs = m_FrameCadence.streamPeriodMs();
-		double arrivalDeltaMs = QpcToMs(now - m_LastEnqueueQpc);
+		arrivalDeltaMs = QpcToMs(now - m_LastEnqueueQpc);
 		double dev = arrivalDeltaMs - periodMs;
 		if (dev < 0.0) {
 			dev = -dev;
@@ -611,8 +628,10 @@ void Pacer::submitFrame(AVFrame *frame) {
 		// Producer-side burst signal: this frame arrived clustered with the previous one
 		// (< 0.6 period apart), which at target 1 forces a catch-up drop. Measured here at
 		// enqueue by timestamp -> independent of the render buffer depth. Feeds both the
-		// per-second CSV counter and the decaying controller score (single writer: this thread).
-		double burstScore = m_ArrivalBurstScore.load(std::memory_order_relaxed) * kBurstForget;
+		// per-second CSV counter and the decaying controller score (single writer: this
+		// thread); the decay uses the actual elapsed time, so it's fps-independent.
+		double burstScore = m_ArrivalBurstScore.load(std::memory_order_relaxed) *
+		                    exp2(-arrivalDeltaMs / kBurstHalfLifeMs);
 		if (periodMs > 0.0 && arrivalDeltaMs < 0.6 * periodMs) {
 			m_DeviceResources->GetStats()->SubmitArrivalBurst();
 			burstScore += 1.0;
@@ -633,7 +652,7 @@ void Pacer::submitFrame(AVFrame *frame) {
 			if (curMin < 0.0) {
 				curMin = margin;
 			} else {
-				curMin += kPhaseRelaxMsPerFrame;
+				curMin += kPhaseRelaxMsPerSecond * (arrivalDeltaMs / 1000.0);
 				if (curMin > kPhaseMarginCapMs) {
 					curMin = kPhaseMarginCapMs;
 				}

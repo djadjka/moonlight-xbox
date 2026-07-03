@@ -85,6 +85,7 @@ class Pacer {
 	// rises -> PACING_ADAPTIVE buffers; it decays back so the buffer reclaims latency when decode
 	// gets easy. Buffer-independent (decode duration is upstream of the queue) -> can't oscillate.
 	std::atomic<double> m_RecentMaxDecodeMs{0.0};
+	int64_t m_LastDecodeObsQpc = 0;  ///< decoder thread: time base for the wall-clock decode-max decay
 	// Decaying MIN of the arrival-to-next-vblank margin (ms), written in submitFrame on the
 	// decoder thread, read by overlay/CSV; -1 until the first value. MEASUREMENT ONLY for now:
 	// candidate 3rd controller signal (delivery-phase health). Buffer-independent by design —
