@@ -369,10 +369,10 @@ void Stats::formatVideoStats(DX::StepTimer const& timer, VIDEO_STATS& stats, cha
 		// phase_min = delivery-phase margin to the next vblank, measurement only for now).
 		if (Pacer::instance().getPacingMode() == Pacer::PACING_ADAPTIVE) {
 			ret = snprintf(&output[offset], length - offset,
-			               "Adaptive: target %d (hwm %d)  decode_max %.2f ms  jitter %.2f ms  phase_min %.2f ms  [logging: %s]\n",
+			               "Adaptive: target %d (hwm %d)  decode_max %.2f ms  jitter %.2f ms  phase_min %.2f ms  burst %.1f  [logging: %s]\n",
 			               Pacer::instance().getAdaptiveTarget(), Pacer::instance().getCurrentHwm(),
 			               Pacer::instance().getRecentMaxDecodeMs(), Pacer::instance().getArrivalJitterMs(),
-			               Pacer::instance().getPhaseMarginMinMs(),
+			               Pacer::instance().getPhaseMarginMinMs(), Pacer::instance().getArrivalBurstScore(),
 			               isCsvLogging() ? "ON" : "off");
 			if (ret > 0 && (size_t)ret < (length - offset)) {
 				offset += ret;
@@ -495,14 +495,14 @@ void Stats::logCsvLine(VIDEO_STATS& s, double now) {
 
 	char buf[512];
 	int n = snprintf(buf, sizeof(buf),
-	                 "%.1f,%s,%.2f,%.2f,%.2f,%.2f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%u,%u,%u,%u,%.1f,%.3f,%.3f,%.3f,%.2f,%d,%d,%.3f\n",
+	                 "%.1f,%s,%.2f,%.2f,%.2f,%.2f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%u,%u,%u,%u,%.1f,%.3f,%.3f,%.3f,%.2f,%d,%d,%.3f,%.2f\n",
 	                 now, mode, s.receivedFps, s.decodedFps, s.renderedFps, m_avgQueueSize,
 	                 q_ms, render_ms, present_ms, decode_ms,
 	                 Pacer::instance().getRecentMaxDecodeMs(), Pacer::instance().getArrivalJitterMs(),
 	                 net_drop, s.pacerDroppedFrames, s.pacerCatchupDrops, s.arrivalBursts, s.lastRtt, m_bwTracker.GetAverageMbps(),
 	                 ft_mean, ft_sd, s.maxFrametimeMs, missed,
 	                 Pacer::instance().getAdaptiveTarget(), Pacer::instance().getCurrentHwm(),
-	                 Pacer::instance().getPhaseMarginMinMs());
+	                 Pacer::instance().getPhaseMarginMinMs(), Pacer::instance().getArrivalBurstScore());
 	if (n <= 0) {
 		return;
 	}
@@ -532,7 +532,7 @@ void Stats::startCsvLogging() {
 		if (f.is_open()) {
 			f << "t_s,mode,recv_fps,dec_fps,rend_fps,frames_in_q,q_ms,render_ms,present_ms,"
 			     "decode_ms,decode_max_ms,jitter_ms,net_drop_pct,pacer_drops,catchup_drops,arr_burst,rtt_ms,bitrate_mbps,"
-			     "ft_mean_ms,ft_sd_ms,ft_max_ms,missed_pct,adaptive_target,hwm,phase_min_ms\n";
+			     "ft_mean_ms,ft_sd_ms,ft_max_ms,missed_pct,adaptive_target,hwm,phase_min_ms,burst_score\n";
 		}
 	} catch (...) {
 		m_csvPath.clear();

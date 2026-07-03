@@ -46,7 +46,8 @@ class Pacer {
 	double getRecentMaxDecodeMs();          // decaying-max decode time (complex-scene signal)
 	double getArrivalJitterMs();            // RFC 3550 arrival jitter (network signal)
 	int    getCurrentHwm();                 // current FrameQueue high-water
-	double getPhaseMarginMinMs();           // decaying-min arrival-to-vblank margin (measurement only)
+	double getPhaseMarginMinMs();           // decaying-min arrival-to-vblank margin (explanatory metric)
+	double getArrivalBurstScore();          // decaying count of clustered arrivals (3rd controller signal)
 
   private:
 	Pacer();
@@ -89,6 +90,12 @@ class Pacer {
 	// candidate 3rd controller signal (delivery-phase health). Buffer-independent by design —
 	// arrivals are set by the network/host, vblank grid by the display; the queue affects neither.
 	std::atomic<double> m_PhaseMarginMinMs{-1.0};
+	// Decaying score of clustered arrivals (bursts), written in submitFrame on the decoder
+	// thread. A starve+catch-up cycle at depth 1 always produces a producer-side burst (the
+	// late frame arrives clustered with the next one), so this is the delivery-phase controller
+	// signal: it persists regardless of buffer depth (arrivals don't change when we buffer),
+	// which is what makes it oscillation-proof, unlike render-side starve/drop counts.
+	std::atomic<double> m_ArrivalBurstScore{0.0};
 	int m_LastHwm = 3;  // render thread: last high-water set (== FRAME_QUEUE_HIGH; avoids re-locking)
 	std::atomic<int> m_AdaptiveTargetPublished{1};  // current target, for the overlay/CSV
 

@@ -44,6 +44,14 @@ constexpr double kDecodeForget = 0.99;
 constexpr double kPhaseRelaxMsPerFrame = 0.05;
 constexpr double kPhaseMarginCapMs = 25.0;
 
+// Burst-score signal: each clustered arrival adds 1, the score decays per frame. Validated
+// on-device: the "heavy scene" runs 1-2 starve+catch-up cycles/s = 2-5 bursts/s (score ~4),
+// a clean scene has none. Half-life ~2.3 s @120fps. Threshold 1.5 means a single isolated
+// burst never grows the buffer (needs >= 2 within ~2.5 s); the heavy scene trips within a
+// second or two, and it reclaims after ~3-4 burst-free seconds.
+constexpr double kBurstForget = 0.9975;
+constexpr double kBurstDepthThreshold = 1.5;
+
 using steady_clock = std::chrono::steady_clock;
 using namespace moonlight_xbox_dx;
 
@@ -113,9 +121,10 @@ void Pacer::init(const std::shared_ptr<DX::DeviceResources> &res, int streamFps,
 	m_LastSyncTarget = 0;
 	m_ewmaVsyncDriftQpc = MsToQpc(0.0001);
 
-	// Reset the PACING_ADAPTIVE decode-time signal so a reconnect starts at the low-latency floor.
+	// Reset the PACING_ADAPTIVE signals so a reconnect starts at the low-latency floor.
 	m_RecentMaxDecodeMs.store(0.0, std::memory_order_relaxed);
 	m_PhaseMarginMinMs.store(-1.0, std::memory_order_relaxed);
+	m_ArrivalBurstScore.store(0.0, std::memory_order_relaxed);
 	m_AdaptiveTargetPublished.store(1, std::memory_order_relaxed);
 	m_LastHwm = FRAME_QUEUE_HIGH;
 
@@ -306,7 +315,17 @@ bool Pacer::renderModeImmediate(std::shared_ptr<VideoRenderer> &sceneRenderer) {
 					decodeDepth = 1 + extra;
 				}
 
+				// Delivery-phase term: recurring clustered arrivals mean the arrival phase runs
+				// at the present deadline (starve + catch-up pairs at depth 1, the validated
+				// "heavy scene" judder). One buffered frame absorbs the pair completely: the
+				// starved slot presents the spare, the burst refills it, nothing is dropped.
+				// Bursts persist regardless of depth, so this reclaims only when the phase heals.
+				int burstDepth = m_ArrivalBurstScore.load(std::memory_order_relaxed) >= kBurstDepthThreshold ? 2 : 1;
+
 				target = jitterDepth > decodeDepth ? jitterDepth : decodeDepth;
+				if (burstDepth > target) {
+					target = burstDepth;
+				}
 				if (target > 3) { // cap: 2-3 is the useful range; 4 = needless latency at 120Hz
 					target = 3;
 				}
@@ -504,6 +523,10 @@ double Pacer::getPhaseMarginMinMs() {
 	return m_PhaseMarginMinMs.load(std::memory_order_relaxed);
 }
 
+double Pacer::getArrivalBurstScore() {
+	return m_ArrivalBurstScore.load(std::memory_order_relaxed);
+}
+
 // Distance (ms) from `nowQpc` to the next FULL-vblank boundary, using the same hardware
 // vsync tracking as getNextVBlankQpc but with no side effects and no half-slot gate: the
 // half-vblank present gate is a scheduling detail, actual flips happen on the full grid.
@@ -541,12 +564,16 @@ void Pacer::submitFrame(AVFrame *frame) {
 		double j = m_ArrivalJitterMs.load(std::memory_order_acquire);
 		m_ArrivalJitterMs.store(j + (dev - j) / 16.0, std::memory_order_release);
 
-		// Producer-side burst signal (debug trace): this frame arrived clustered with the
-		// previous one (< 0.6 period apart), which at target 1 forces a catch-up drop. Measured
-		// here at enqueue by timestamp -> independent of the render buffer depth.
+		// Producer-side burst signal: this frame arrived clustered with the previous one
+		// (< 0.6 period apart), which at target 1 forces a catch-up drop. Measured here at
+		// enqueue by timestamp -> independent of the render buffer depth. Feeds both the
+		// per-second CSV counter and the decaying controller score (single writer: this thread).
+		double burstScore = m_ArrivalBurstScore.load(std::memory_order_relaxed) * kBurstForget;
 		if (periodMs > 0.0 && arrivalDeltaMs < 0.6 * periodMs) {
 			m_DeviceResources->GetStats()->SubmitArrivalBurst();
+			burstScore += 1.0;
 		}
+		m_ArrivalBurstScore.store(burstScore, std::memory_order_relaxed);
 	}
 	m_LastEnqueueQpc = now;
 	m_HaveLastEnqueue = true;
