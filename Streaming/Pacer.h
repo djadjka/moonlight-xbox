@@ -98,10 +98,12 @@ class Pacer {
 	std::atomic<double> m_ArrivalBurstScore{0.0};
 	int m_LastHwm = 3;  // render thread: last high-water set (== FRAME_QUEUE_HIGH; avoids re-locking)
 	// Render-thread controller state: burst-signal hysteresis latch (enter 1.5 / release 0.5)
-	// and the lazily-shrunk effective target (grow instant, shrink only at drain moments so
-	// reclaim never has to drop a frame).
+	// and the lazily-shrunk effective target (grow instant, shrink only at drain moments AND
+	// after the desired value stayed below it for the dwell, so reclaim never drops a frame
+	// and momentary signal dips can't lower the ceiling into an oncoming clump).
 	bool m_BurstLatched = false;
 	int m_EffectiveTarget = 1;
+	int64_t m_ShrinkArmedQpc = 0;  ///< when the desired target first dipped below the effective one
 	std::atomic<int> m_AdaptiveTargetPublished{1};  // current target, for the overlay/CSV
 
 	FrameCadence m_FrameCadence;

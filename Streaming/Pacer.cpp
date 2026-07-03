@@ -54,6 +54,13 @@ constexpr double kBurstForget = 0.9975;
 constexpr double kBurstEnterScore = 1.5;
 constexpr double kBurstReleaseScore = 0.5;
 
+// Lazy-shrink dwell: the effective target may step down only after the desired target has
+// stayed below it for this long. Under slot-type network jitter the RFC-J estimate wobbles
+// across a depth boundary for ~a second at a time while the queue drains in every gap; an
+// undelayed shrink lowered the ceiling right before the next clump and culled it (measured:
+// the seconds with a momentary target dip carried a disproportionate share of the drops).
+constexpr double kShrinkDwellMs = 1500.0;
+
 using steady_clock = std::chrono::steady_clock;
 using namespace moonlight_xbox_dx;
 
@@ -130,6 +137,7 @@ void Pacer::init(const std::shared_ptr<DX::DeviceResources> &res, int streamFps,
 	m_AdaptiveTargetPublished.store(1, std::memory_order_relaxed);
 	m_BurstLatched = false;
 	m_EffectiveTarget = 1;
+	m_ShrinkArmedQpc = 0;
 	m_LastHwm = FRAME_QUEUE_HIGH;
 
 	// Start FrameQueue so it's ready to receive new frames
@@ -345,10 +353,14 @@ bool Pacer::renderModeImmediate(std::shared_ptr<VideoRenderer> &sceneRenderer) {
 		// Instant grow, lazy shrink: raising the target takes effect immediately (absorb the
 		// trouble NOW), but lowering it never drops a frame — the effective target steps down
 		// only at a natural drain moment (queue empty), which the 119.88-in-120Hz cadence
-		// guarantees within seconds. Measured motivation: reclaim-drops during a flapping
-		// episode were themselves the visible skips.
+		// guarantees within seconds, and only after the desired value has stayed below it for
+		// the dwell period (momentary signal dips must not lower the ceiling into an oncoming
+		// clump). Measured motivation: reclaim-drops during flapping were the visible skips.
 		if (target >= m_EffectiveTarget) {
 			m_EffectiveTarget = target;
+			m_ShrinkArmedQpc = 0;
+		} else if (m_ShrinkArmedQpc == 0) {
+			m_ShrinkArmedQpc = QpcNow();
 		}
 		const int desiredTarget = target;
 		target = m_EffectiveTarget;
@@ -373,15 +385,20 @@ bool Pacer::renderModeImmediate(std::shared_ptr<VideoRenderer> &sceneRenderer) {
 			av_frame_free(&old);
 			++droppedToCatchUp;
 		}
+		// A drain moment (empty queue) makes shrinking free; the dwell gate above decides
+		// whether the shrink is actually due.
+		const bool shrinkDue = m_ShrinkArmedQpc != 0 && QpcToMs(QpcNow() - m_ShrinkArmedQpc) >= kShrinkDwellMs;
 		newFrame = FrameQueue::instance().dequeue();
 		if (!newFrame) {
-			// Starve: the queue is empty, so shrinking the effective target is free here
-			m_EffectiveTarget = desiredTarget;
+			if (shrinkDue) {
+				m_EffectiveTarget = desiredTarget;
+				m_ShrinkArmedQpc = 0;
+			}
 			return false; // no frame, don't Present()
 		}
-		if (FrameQueue::instance().count() == 0) {
-			// Drained to the last frame: same free-shrink opportunity
+		if (shrinkDue && FrameQueue::instance().count() == 0) {
 			m_EffectiveTarget = desiredTarget;
+			m_ShrinkArmedQpc = 0;
 		}
 	} else {
 		// PACING_IMMEDIATE: lowest latency. Render the NEWEST available frame and discard
