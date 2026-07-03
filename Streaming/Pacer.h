@@ -46,6 +46,7 @@ class Pacer {
 	double getRecentMaxDecodeMs();          // decaying-max decode time (complex-scene signal)
 	double getArrivalJitterMs();            // RFC 3550 arrival jitter (network signal)
 	int    getCurrentHwm();                 // current FrameQueue high-water
+	double getPhaseMarginMinMs();           // decaying-min arrival-to-vblank margin (measurement only)
 
   private:
 	Pacer();
@@ -64,6 +65,7 @@ class Pacer {
 	bool renderModeDisplayLocked(std::shared_ptr<moonlight_xbox_dx::VideoRenderer> &sceneRenderer);
 	void vsyncHardware();
 	void updateFrameStats();
+	double vblankPhaseMarginMs(int64_t nowQpc);  // ms from nowQpc to the next FULL-vblank flip; -1 until vsync tracking is up
 
 	std::shared_ptr<DX::DeviceResources> m_DeviceResources;
 	std::thread m_VsyncThread;
@@ -82,6 +84,11 @@ class Pacer {
 	// rises -> PACING_ADAPTIVE buffers; it decays back so the buffer reclaims latency when decode
 	// gets easy. Buffer-independent (decode duration is upstream of the queue) -> can't oscillate.
 	std::atomic<double> m_RecentMaxDecodeMs{0.0};
+	// Decaying MIN of the arrival-to-next-vblank margin (ms), written in submitFrame on the
+	// decoder thread, read by overlay/CSV; -1 until the first value. MEASUREMENT ONLY for now:
+	// candidate 3rd controller signal (delivery-phase health). Buffer-independent by design —
+	// arrivals are set by the network/host, vblank grid by the display; the queue affects neither.
+	std::atomic<double> m_PhaseMarginMinMs{-1.0};
 	int m_LastHwm = 3;  // render thread: last high-water set (== FRAME_QUEUE_HIGH; avoids re-locking)
 	std::atomic<int> m_AdaptiveTargetPublished{1};  // current target, for the overlay/CSV
 

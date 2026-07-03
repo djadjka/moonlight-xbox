@@ -38,6 +38,12 @@ constexpr int FRAME_QUEUE_HIGH = 3;
 // (~0.6 s half-life @120fps), so a complex scene buffers and a clean scene reclaims latency.
 constexpr double kDecodeForget = 0.99;
 
+// Phase-margin measurement: the decaying MIN relaxes upward by this much per arriving frame
+// (~6 ms/s @120fps -> forgets a one-off close call in ~1.5 s but tracks a persistent
+// low-margin regime). Clamp keeps the relaxed value in a sane display-period range.
+constexpr double kPhaseRelaxMsPerFrame = 0.05;
+constexpr double kPhaseMarginCapMs = 25.0;
+
 using steady_clock = std::chrono::steady_clock;
 using namespace moonlight_xbox_dx;
 
@@ -109,6 +115,7 @@ void Pacer::init(const std::shared_ptr<DX::DeviceResources> &res, int streamFps,
 
 	// Reset the PACING_ADAPTIVE decode-time signal so a reconnect starts at the low-latency floor.
 	m_RecentMaxDecodeMs.store(0.0, std::memory_order_relaxed);
+	m_PhaseMarginMinMs.store(-1.0, std::memory_order_relaxed);
 	m_AdaptiveTargetPublished.store(1, std::memory_order_relaxed);
 	m_LastHwm = FRAME_QUEUE_HIGH;
 
@@ -493,6 +500,27 @@ int Pacer::getCurrentHwm() {
 	return m_LastHwm;
 }
 
+double Pacer::getPhaseMarginMinMs() {
+	return m_PhaseMarginMinMs.load(std::memory_order_relaxed);
+}
+
+// Distance (ms) from `nowQpc` to the next FULL-vblank boundary, using the same hardware
+// vsync tracking as getNextVBlankQpc but with no side effects and no half-slot gate: the
+// half-vblank present gate is a scheduling detail, actual flips happen on the full grid.
+// Called from the decoder thread; the lock is uncontended in practice (vsyncHardware and
+// the render path touch it briefly).
+double Pacer::vblankPhaseMarginMs(int64_t nowQpc) {
+	std::scoped_lock<std::mutex> lock(m_FrameStatsLock);
+	if (m_LastSyncQpc == 0 || m_VsyncIntervalQpc == 0) {
+		return -1.0;
+	}
+	int64_t next = m_LastSyncQpc + static_cast<int64_t>(m_ewmaVsyncDriftQpc);
+	while (next < nowQpc) {
+		next += m_VsyncIntervalQpc;
+	}
+	return QpcToMs(next - nowQpc);
+}
+
 void Pacer::submitFrame(AVFrame *frame) {
 	// Update cadence from pts if available
 	if (frame->pts) {
@@ -522,6 +550,29 @@ void Pacer::submitFrame(AVFrame *frame) {
 	}
 	m_LastEnqueueQpc = now;
 	m_HaveLastEnqueue = true;
+
+	// Phase margin (measurement only): how close this arrival ran to the next display flip.
+	// The 119.88-content/120Hz-display beat sweeps this through zero every ~8.3 s, and fine
+	// delivery-phase noise near zero is what turns into starve/catch-up pairs at depth 1.
+	// Keep a decaying MIN (slow upward relaxation) for the overlay/CSV; buffer-independent.
+	{
+		double margin = vblankPhaseMarginMs(now);
+		if (margin >= 0.0) {
+			double curMin = m_PhaseMarginMinMs.load(std::memory_order_relaxed);
+			if (curMin < 0.0) {
+				curMin = margin;
+			} else {
+				curMin += kPhaseRelaxMsPerFrame;
+				if (curMin > kPhaseMarginCapMs) {
+					curMin = kPhaseMarginCapMs;
+				}
+				if (margin < curMin) {
+					curMin = margin;
+				}
+			}
+			m_PhaseMarginMinMs.store(curMin, std::memory_order_relaxed);
+		}
+	}
 
 	int dropCount = FrameQueue::instance().enqueue(frame);
 	if (dropCount) {
