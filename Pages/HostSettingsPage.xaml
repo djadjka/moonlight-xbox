@@ -89,6 +89,10 @@
                 Name="FramePacingDisplayLockedDesc" Grid.Row="9" Grid.Column="2" Visibility="Collapsed">
                 Best for Xbox One. Locks rendering frame rate to refresh rate and evenly spaces frames.
             </TextBlock>
+            <TextBlock
+                Name="FramePacingAdaptiveDesc" Grid.Row="9" Grid.Column="2" Visibility="Collapsed">
+                Like Immediate, but adds a small buffer sized to network jitter to smooth out spikes. Low latency on a clean connection.
+            </TextBlock>
 
             <TextBlock Grid.Row="10" Grid.Column="0">Show performance stats:</TextBlock>
             <CheckBox

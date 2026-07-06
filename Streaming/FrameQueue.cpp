@@ -25,7 +25,13 @@ FrameQueue::FrameQueue()
       _tail(0),
       _count(0),
       _droppedLast(false),
-      _maxCapacity(5), // should not exceed swapchain BufferCount
+      // INVARIANT: every queued AVFrame pins one surface of the decoder's fixed D3D11VA
+      // texture-array pool (~20 slices for HEVC: 1 in-flight + 16 max refs + 3 base), and
+      // Pacer holds one more as m_CurrentFrame. _maxCapacity + 1 must stay well below that
+      // pool minus the DPB reference count, or the decoder starves for output surfaces.
+      // 5 + 1 = 6 held vs ~20-slice pool is comfortably safe. Also should not exceed the
+      // swapchain BufferCount.
+      _maxCapacity(5),
       _highWaterMark(3),
       _paused(true) {    // caller will call start()
 
