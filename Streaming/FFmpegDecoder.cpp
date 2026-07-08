@@ -284,9 +284,8 @@ namespace moonlight_xbox_dx {
 			QueryPerformanceCounter(&decodeEnd);
 			frame_attach_userdata(frame, decodeEnd.QuadPart);
 
-			// Feed the adaptive pacer this frame's decode time, EXCLUDING IDR frames (intra
-			// frames are large and slow by nature -> a periodic IDR would falsely pin the
-			// buffer). Sustained P-frame decode pressure is the real "complex scene" signal.
+			// Feed the adaptive pacer this frame's decode time, excluding IDR frames (naturally
+			// slow -> would falsely pin the buffer). Sustained P-frame pressure is the real signal.
 			if (frame->pict_type != AV_PICTURE_TYPE_I) {
 				Pacer::instance().observeDecodeMs(QpcToMs(decodeEnd.QuadPart - decodeStart.QuadPart));
 			}
