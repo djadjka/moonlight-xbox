@@ -85,10 +85,10 @@ namespace moonlight_xbox_dx {
 		Utils::Logf(shouldPrefixThisMessage ? "[ffmpeg] %s" : "%s", lineBuffer);
 	}
 
-    void FFMpegDecoder::CompleteInitialization(const std::shared_ptr<DX::DeviceResources>& res, STREAM_CONFIGURATION *config, bool framePacingImmediate) {
+    void FFMpegDecoder::CompleteInitialization(const std::shared_ptr<DX::DeviceResources>& res, STREAM_CONFIGURATION *config, int pacingMode) {
 		this->m_deviceResources = res;
 		this->fps = config->fps;
-		Pacer::instance().init(res, config->fps, res->GetRefreshRate(), framePacingImmediate);
+		Pacer::instance().init(res, config->fps, res->GetRefreshRate(), pacingMode);
 	}
 
 	int FFMpegDecoder::Init(int videoFormat, int width, int height, int redrawRate, void* context, int drFlags) {
@@ -283,6 +283,12 @@ namespace moonlight_xbox_dx {
 			// Capture a frame timestamp to measuring pacing delay
 			QueryPerformanceCounter(&decodeEnd);
 			frame_attach_userdata(frame, decodeEnd.QuadPart);
+
+			// Feed the adaptive pacer this frame's decode time, excluding IDR frames (naturally
+			// slow -> would falsely pin the buffer). Sustained P-frame pressure is the real signal.
+			if (frame->pict_type != AV_PICTURE_TYPE_I) {
+				Pacer::instance().observeDecodeMs(QpcToMs(decodeEnd.QuadPart - decodeStart.QuadPart));
+			}
 
 			FQLog("✓ Frame decoded [pts: %.3fms] [in#: %d] [out#: %d] [lost: %d] decode time %.3fms\n",
 				frame->pts / 90.0,

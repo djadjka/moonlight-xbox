@@ -299,6 +299,11 @@ void Stats::formatVideoStats(DX::StepTimer const& timer, VIDEO_STATS& stats, cha
 		double avgVideoMbps = m_bwTracker.GetAverageMbps();
 		double peakVideoMbps = m_bwTracker.GetPeakMbps();
 
+		int pacingMode = Pacer::instance().getPacingMode();
+		const char *pacingModeName = pacingMode == Pacer::PACING_DISPLAY_LOCKED ? "display-locked"
+			: pacingMode == Pacer::PACING_ADAPTIVE ? "adaptive"
+			: "immediate";
+
 		ret = snprintf(&output[offset],
 					   length - offset,
 					   "Bitrate: %.1f Mbps, Peak (%us): %.1f\n"
@@ -311,7 +316,7 @@ void Stats::formatVideoStats(DX::StepTimer const& timer, VIDEO_STATS& stats, cha
 					   stats.receivedFps,
 					   stats.decodedFps,
 					   stats.renderedFps,
-					   Pacer::instance().getPacingImmediate() ? "immediate" : "display-locked");
+					   pacingModeName);
 		if (ret < 0 || (size_t)ret >= (length - offset)) {
 			Utils::Log("Error: stringifyVideoStats length overflow\n");
 			return;

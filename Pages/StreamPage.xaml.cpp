@@ -322,9 +322,9 @@ void StreamPage::resetDecoder_Click(Platform::Object^ sender, Windows::UI::Xaml:
 
 void StreamPage::toggleFramePacing_Click(Platform::Object^ sender, Windows::UI::Xaml::RoutedEventArgs^ e)
 {
-	// thread safe atomic bool
-	bool isImmediate = Pacer::instance().getPacingImmediate();
-	Pacer::instance().setPacingImmediate(isImmediate ? false : true);
+	// Cycle Immediate -> Display-locked -> Adaptive at runtime. thread safe atomic int
+	int mode = Pacer::instance().getPacingMode();
+	Pacer::instance().setPacingMode((mode + 1) % Pacer::PACING_MODE_COUNT);
 }
 
 void StreamPage::OnPropertyChanged(Platform::String^ propertyName)

@@ -58,6 +58,7 @@ void HostSettingsPage::OnNavigatedTo(Windows::UI::Xaml::Navigation::NavigationEv
 	AvailableAudioConfigs->Append("Surround 7.1");
 	AvailableFramePacing->Append("Immediate");
 	AvailableFramePacing->Append("Display-locked");
+	AvailableFramePacing->Append("Adaptive");
 	CurrentResolutionIndex = 0;
 	for (int i = 0; i < AvailableResolutions->Size; i++) {
 		if (host->Resolution->Width == AvailableResolutions->GetAt(i)->Width &&
@@ -180,12 +181,15 @@ void HostSettingsPage::FramePacing_SelectionChanged(Platform::Object^ sender, Wi
 {
 	auto selectedFramePacing = AvailableFramePacing->GetAt(this->FramePacingComboBox->SelectedIndex);
 
-	if (selectedFramePacing == "Immediate") {
-		FramePacingImmediateDesc->Visibility = Windows::UI::Xaml::Visibility::Visible;
-		FramePacingDisplayLockedDesc->Visibility = Windows::UI::Xaml::Visibility::Collapsed;
-	} else {
-		FramePacingImmediateDesc->Visibility = Windows::UI::Xaml::Visibility::Collapsed;
+	FramePacingImmediateDesc->Visibility = Windows::UI::Xaml::Visibility::Collapsed;
+	FramePacingDisplayLockedDesc->Visibility = Windows::UI::Xaml::Visibility::Collapsed;
+	FramePacingAdaptiveDesc->Visibility = Windows::UI::Xaml::Visibility::Collapsed;
+	if (selectedFramePacing == "Display-locked") {
 		FramePacingDisplayLockedDesc->Visibility = Windows::UI::Xaml::Visibility::Visible;
+	} else if (selectedFramePacing == "Adaptive") {
+		FramePacingAdaptiveDesc->Visibility = Windows::UI::Xaml::Visibility::Visible;
+	} else {
+		FramePacingImmediateDesc->Visibility = Windows::UI::Xaml::Visibility::Visible;
 	}
 
 	host->FramePacing = selectedFramePacing;

@@ -4,6 +4,7 @@
 #include "Pacer.h"
 #include <algorithm>
 #include <chrono>
+#include <cmath>
 #include <thread>
 #include <windows.h>
 #include "../Plot/ImGuiPlots.h"
@@ -34,6 +35,23 @@
 constexpr int FRAME_QUEUE_LOW = 1;
 constexpr int FRAME_QUEUE_HIGH = 3;
 
+// All adaptive signal time constants are wall-clock half-lives (decayed by real elapsed time
+// between updates), not per-frame factors, so the controller behaves identically at 30/60/90/120
+// fps. Validated on-device at 120 fps.
+
+// Decode signal: decaying max of per-frame decode time (complex scene buffers, clean scene reclaims).
+constexpr double kDecodeHalfLifeMs = 600.0;
+
+// Burst signal: each clustered arrival adds 1, decaying. Enter at 1.5 so a single stray burst can't
+// grow the buffer; release below 0.5 to stop the score flapping the target and manufacturing drops.
+constexpr double kBurstHalfLifeMs = 2300.0;
+constexpr double kBurstEnterScore = 1.5;
+constexpr double kBurstReleaseScore = 0.5;
+
+// Lazy-shrink dwell: step the effective target down only after the desired target has stayed below
+// it this long, so a momentary dip can't lower the ceiling right before the next clump and cull it.
+constexpr double kShrinkDwellMs = 1500.0;
+
 using steady_clock = std::chrono::steady_clock;
 using namespace moonlight_xbox_dx;
 
@@ -49,7 +67,6 @@ Pacer::Pacer()
       m_Stopping(false),
       m_StreamFps(0),
       m_RefreshRate(0.0),
-      m_FramePacingImmediate(true),
       m_FrameCadence(),
       m_LastSyncRefreshCount(0),
       m_LastSyncQpc(0),
@@ -78,17 +95,23 @@ void Pacer::deinit() {
 	Utils::Logf("Pacer: deinit\n");
 }
 
-void Pacer::init(const std::shared_ptr<DX::DeviceResources> &res, int streamFps, double refreshRate, bool framePacingImmediate) {
+void Pacer::init(const std::shared_ptr<DX::DeviceResources> &res, int streamFps, double refreshRate, int pacingMode) {
 	m_Stopping.store(false, std::memory_order_release);
 	m_DeviceResources = res;
 	m_StreamFps = streamFps;
 	m_RefreshRate = refreshRate;
-	m_FramePacingImmediate.store(framePacingImmediate, std::memory_order_release);
+	if (pacingMode < 0 || pacingMode >= PACING_MODE_COUNT) {
+		pacingMode = PACING_IMMEDIATE;
+	}
+	m_PacingMode.store(pacingMode, std::memory_order_release);
 
 	m_FrameCadence.init(m_RefreshRate > 0.0 ? m_RefreshRate : 60.0, static_cast<double>(streamFps));
 
+	const char *modeName = pacingMode == PACING_DISPLAY_LOCKED ? "display-locked"
+	                       : pacingMode == PACING_ADAPTIVE     ? "adaptive"
+	                                                           : "immediate";
 	Utils::Logf("Frame Pacer init: mode %s, streamFps %d, refreshRate %.2f\n",
-	            framePacingImmediate ? "immediate" : "display-locked", m_StreamFps, m_RefreshRate);
+	            modeName, m_StreamFps, m_RefreshRate);
 
 	m_vhsum = 0;
 	m_vhcount = 0;
@@ -97,6 +120,20 @@ void Pacer::init(const std::shared_ptr<DX::DeviceResources> &res, int streamFps,
 	m_VsyncIntervalQpc = 0;
 	m_LastSyncTarget = 0;
 	m_ewmaVsyncDriftQpc = MsToQpc(0.0001);
+
+	// Reset the adaptive signals so a reconnect starts at the low-latency floor: init() re-runs on
+	// the singleton per stream, and a stale inter-arrival gap would otherwise spike the RFC-3550
+	// jitter EWMA and pin the buffer at the cap exactly when we want the floor.
+	m_RecentMaxDecodeMs.store(0.0, std::memory_order_relaxed);
+	m_LastDecodeObsQpc = 0;
+	m_ArrivalJitterMs.store(0.0, std::memory_order_relaxed);
+	m_LastEnqueueQpc = 0;
+	m_HaveLastEnqueue = false;
+	m_ArrivalBurstScore.store(0.0, std::memory_order_relaxed);
+	m_BurstLatched = false;
+	m_EffectiveTarget = 1;
+	m_ShrinkArmedQpc = 0;
+	m_LastHwm = FRAME_QUEUE_HIGH;
 
 	// Start FrameQueue so it's ready to receive new frames
 	FrameQueue::instance().setHighWaterMark(FRAME_QUEUE_HIGH);
@@ -110,11 +147,18 @@ void Pacer::init(const std::shared_ptr<DX::DeviceResources> &res, int streamFps,
 }
 
 bool Pacer::getPacingImmediate() {
-	return m_FramePacingImmediate.load(std::memory_order_acquire);
+	return m_PacingMode.load(std::memory_order_acquire) != PACING_DISPLAY_LOCKED;
 }
 
-void Pacer::setPacingImmediate(bool framePacingImmediate) {
-	m_FramePacingImmediate.store(framePacingImmediate, std::memory_order_release);
+int Pacer::getPacingMode() {
+	return m_PacingMode.load(std::memory_order_acquire);
+}
+
+void Pacer::setPacingMode(int mode) {
+	if (mode < 0 || mode >= PACING_MODE_COUNT) {
+		mode = PACING_IMMEDIATE;
+	}
+	m_PacingMode.store(mode, std::memory_order_release);
 }
 
 void Pacer::vsyncHardware() {
@@ -227,32 +271,140 @@ void Pacer::waitForFrame(double timeoutMs) {
 bool Pacer::renderOnMainThread(std::shared_ptr<VideoRenderer> &sceneRenderer) {
 	if (!running()) return false;
 
-	if (m_FramePacingImmediate.load(std::memory_order_acquire)) {
-		return renderModeImmediate(sceneRenderer);
-	} else {
+	const int mode = m_PacingMode.load(std::memory_order_acquire);
+
+	// Only ADAPTIVE grows the buffer; init() otherwise resets the high-water. Restore the
+	// low-latency floor when leaving Adaptive so IMMEDIATE/DISPLAY_LOCKED don't inherit a grown queue.
+	if (mode != PACING_ADAPTIVE) {
+		m_EffectiveTarget = 1;
+		m_ShrinkArmedQpc = 0;
+		m_BurstLatched = false;
+		if (m_LastHwm != FRAME_QUEUE_HIGH) {
+			FrameQueue::instance().setHighWaterMark(FRAME_QUEUE_HIGH);
+			m_LastHwm = FRAME_QUEUE_HIGH;
+		}
+	}
+
+	if (mode == PACING_DISPLAY_LOCKED) {
 		return renderModeDisplayLocked(sceneRenderer);
+	} else {
+		return renderModeImmediate(sceneRenderer);
 	}
 }
 
-// Dequeue a new frame if available and immediately render it. When no new frame is available
-// skips Present and relies on the system to continue showing the previous frame.
+// Dequeue and immediately render the newest frame, skipping Present when none is ready.
+// IMMEDIATE drops all older frames; ADAPTIVE drops down to a small jitter-sized target, keeping a
+// buffer to absorb transient spikes.
 // Pros: lowest latency, output framerate matches input framerate
 // Cons: only works well on Xbox Series for some reason
 bool Pacer::renderModeImmediate(std::shared_ptr<VideoRenderer> &sceneRenderer) {
-	AVFrame *newFrame = FrameQueue::instance().dequeue();
-	if (!newFrame) {
-		return false; // no frame, don't Present()
+	const int mode = m_PacingMode.load(std::memory_order_acquire);
+	int droppedToCatchUp = 0;
+	AVFrame *newFrame = nullptr;
+
+	if (mode == PACING_ADAPTIVE) {
+		// Size the drop target to recent judder: 1 on a clean link (== IMMEDIATE), growing only to
+		// absorb transient spikes, then reclaiming. Signals are buffer-independent so the controller
+		// can't oscillate; take the max, drop oldest frames down to it, render FIFO when buffering.
+		int target = 1;
+		// Leniency only helps when the source can outpace the display; otherwise a backlog
+		// can't be sustained by rate, so stay strict (lowest latency).
+		if (m_StreamFps >= m_RefreshRate) {
+			const double frameMs = m_FrameCadence.streamPeriodMs();
+			if (frameMs > 0.0) {
+				// Network-jitter term: cover the RFC-3550 jitter tail, rounded to whole frames.
+				const double jitterMs = m_ArrivalJitterMs.load(std::memory_order_acquire);
+				const double kJitterSafety = 2.0;
+				int jitterDepth = 1 + static_cast<int>(((jitterMs * kJitterSafety) / frameMs) + 0.5);
+
+				// Decode term: grow only when a frame overruns its period budget (steady hard
+				// decoding stays at 1); reclaims as the decaying max falls.
+				const double decodeMs = m_RecentMaxDecodeMs.load(std::memory_order_relaxed);
+				int decodeDepth = 1;
+				const double overrunMs = decodeMs - frameMs;
+				if (overrunMs > 0.0) {
+					int extra = static_cast<int>(overrunMs / frameMs);
+					if (overrunMs > extra * frameMs) extra += 1; // ceil
+					decodeDepth = 1 + extra;
+				}
+
+				// Burst term: recurring clustered arrivals ("heavy scene" judder) cause starve+
+				// catch-up drops at depth 1; one buffered frame absorbs the pair. Hysteresis keeps
+				// one episode = one depth-2 window.
+				double burstScore = m_ArrivalBurstScore.load(std::memory_order_relaxed);
+				if (burstScore >= kBurstEnterScore) {
+					m_BurstLatched = true;
+				} else if (burstScore < kBurstReleaseScore) {
+					m_BurstLatched = false;
+				}
+				int burstDepth = m_BurstLatched ? 2 : 1;
+
+				target = jitterDepth > decodeDepth ? jitterDepth : decodeDepth;
+				if (burstDepth > target) {
+					target = burstDepth;
+				}
+				if (target > 3) { // cap: 2-3 is the useful range; 4 = needless latency at 120Hz
+					target = 3;
+				}
+			}
+		}
+		// Instant grow, lazy shrink: raise immediately, but lower only at a drain moment (queue
+		// empty) after the dwell, so reclaiming never itself drops a frame.
+		if (target >= m_EffectiveTarget) {
+			m_EffectiveTarget = target;
+			m_ShrinkArmedQpc = 0;
+		} else if (m_ShrinkArmedQpc == 0) {
+			m_ShrinkArmedQpc = QpcNow();
+		}
+		const int desiredTarget = target;
+		target = m_EffectiveTarget;
+		// High-water = target + 1 so a grown buffer keeps the newest frames; touch it only on change.
+		{
+			int hwm = target + 1;
+			if (hwm < FRAME_QUEUE_HIGH) hwm = FRAME_QUEUE_HIGH;
+			if (hwm > 5) hwm = 5; // FrameQueue capacity
+			if (hwm != m_LastHwm) {
+				FrameQueue::instance().setHighWaterMark(hwm);
+				m_LastHwm = hwm;
+			}
+		}
+		while (FrameQueue::instance().count() > target) {
+			AVFrame *old = FrameQueue::instance().dequeue();
+			if (!old) {
+				break;
+			}
+			av_frame_free(&old);
+			++droppedToCatchUp;
+		}
+		// A drain moment (empty queue) makes shrinking free; the dwell gate decides if it's due.
+		const bool shrinkDue = m_ShrinkArmedQpc != 0 && QpcToMs(QpcNow() - m_ShrinkArmedQpc) >= kShrinkDwellMs;
+		newFrame = FrameQueue::instance().dequeue();
+		if (!newFrame) {
+			if (shrinkDue) {
+				m_EffectiveTarget = desiredTarget;
+				m_ShrinkArmedQpc = 0;
+			}
+			return false; // no frame, don't Present()
+		}
+		if (shrinkDue && FrameQueue::instance().count() == 0) {
+			m_EffectiveTarget = desiredTarget;
+			m_ShrinkArmedQpc = 0;
+		}
+	} else {
+		// IMMEDIATE: render the newest frame and discard older ones so no standing buffer forms.
+		newFrame = FrameQueue::instance().dequeue();
+		if (!newFrame) {
+			return false; // no frame, don't Present()
+		}
+		for (AVFrame *newer; (newer = FrameQueue::instance().dequeue()) != nullptr;) {
+			av_frame_free(&newFrame);
+			newFrame = newer;
+			++droppedToCatchUp;
+		}
 	}
 
-	// if we're a frame behind, catch up
-	int queueDepth = FrameQueue::instance().count();
-	if (queueDepth > FRAME_QUEUE_LOW) {
-		AVFrame *newFrame2 = FrameQueue::instance().dequeue();
-		if (newFrame2) {
-			av_frame_free(&newFrame);
-			newFrame = newFrame2;
-			ImGuiPlots::instance().observeFloat(PLOT_DROPPED_PACER, 1.0);
-		}
+	if (droppedToCatchUp > 0) {
+		ImGuiPlots::instance().observeFloat(PLOT_DROPPED_PACER, (float) droppedToCatchUp);
 	}
 
 	if (m_CurrentFrame) {
@@ -368,12 +520,51 @@ int64_t Pacer::getCurrentFramePts() {
 
 // end main thread
 
-// called by decoder thread
+// called by decoder thread, NON-IDR frames only (an IDR is naturally slow and would falsely pin the
+// buffer). Decaying max of per-frame decode time. Single writer, so the read-modify-write is race-free.
+void Pacer::observeDecodeMs(double decodeMs) {
+	int64_t now = QpcNow();
+	double cur = m_RecentMaxDecodeMs.load(std::memory_order_relaxed);
+	if (m_LastDecodeObsQpc != 0) {
+		cur *= exp2(-QpcToMs(now - m_LastDecodeObsQpc) / kDecodeHalfLifeMs);
+	}
+	m_LastDecodeObsQpc = now;
+	if (decodeMs > cur) {
+		cur = decodeMs;
+	}
+	m_RecentMaxDecodeMs.store(cur, std::memory_order_relaxed);
+}
+
 void Pacer::submitFrame(AVFrame *frame) {
 	// Update cadence from pts if available
 	if (frame->pts) {
 		m_FrameCadence.observeFramePts(frame->pts);
 	}
+
+	// RFC 3550 arrival-jitter estimate: J += (|D| - J)/16, D = actual vs expected inter-arrival.
+	int64_t now = QpcNow();
+	double arrivalDeltaMs = 0.0;
+	if (m_HaveLastEnqueue) {
+		double periodMs = m_FrameCadence.streamPeriodMs();
+		arrivalDeltaMs = QpcToMs(now - m_LastEnqueueQpc);
+		double dev = arrivalDeltaMs - periodMs;
+		if (dev < 0.0) {
+			dev = -dev;
+		}
+		double j = m_ArrivalJitterMs.load(std::memory_order_acquire);
+		m_ArrivalJitterMs.store(j + (dev - j) / 16.0, std::memory_order_release);
+
+		// Burst signal: this frame arrived clustered (< 0.6 period) with the previous one. Measured
+		// at enqueue by timestamp, so it's independent of the render buffer depth.
+		double burstScore = m_ArrivalBurstScore.load(std::memory_order_relaxed) *
+		                    exp2(-arrivalDeltaMs / kBurstHalfLifeMs);
+		if (periodMs > 0.0 && arrivalDeltaMs < 0.6 * periodMs) {
+			burstScore += 1.0;
+		}
+		m_ArrivalBurstScore.store(burstScore, std::memory_order_relaxed);
+	}
+	m_LastEnqueueQpc = now;
+	m_HaveLastEnqueue = true;
 
 	int dropCount = FrameQueue::instance().enqueue(frame);
 	if (dropCount) {
