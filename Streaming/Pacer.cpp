@@ -35,33 +35,21 @@
 constexpr int FRAME_QUEUE_LOW = 1;
 constexpr int FRAME_QUEUE_HIGH = 3;
 
-// All signal time constants are WALL-CLOCK-based (half-lives in ms, decayed by the actual
-// elapsed time between updates), NOT per-frame factors, so the controller behaves identically
-// at 30/60/90/120 fps. (Per-frame factors would stretch every reaction time 2x at 60 fps and
-// 4x at 30 fps.) Values were validated on-device at 120 fps.
+// All adaptive signal time constants are wall-clock half-lives (decayed by real elapsed time
+// between updates), not per-frame factors, so the controller behaves identically at 30/60/90/120
+// fps. Validated on-device at 120 fps.
 
-// PACING_ADAPTIVE decode-time signal: decaying max of per-frame decode time, so a complex
-// scene buffers and a clean scene reclaims latency. 600 ms half-life (== the validated
-// 0.99-per-frame factor at 120 fps).
+// Decode signal: decaying max of per-frame decode time (complex scene buffers, clean scene reclaims).
 constexpr double kDecodeHalfLifeMs = 600.0;
 
-// Burst-score signal: each clustered arrival adds 1, the score decays with a 2.3 s half-life
-// (== the validated 0.9975-per-frame factor at 120 fps; steady-state score ~3.3x the bursts/s
-// rate). Validated on-device: the "heavy scene" runs 1-2 starve+catch-up cycles/s = 2-5
-// bursts/s (score ~4), a clean scene has none. Enter at 1.5 so a single isolated burst never
-// grows the buffer (needs >= 2 within a couple of seconds); release only below 0.5 — a
-// real-gameplay episode showed the score wandering around a single threshold (1.0-1.9 for
-// ~15 s), flapping the target 1<->2 seven times and manufacturing a reclaim-drop on every
-// downswing.
+// Burst signal: each clustered arrival adds 1, decaying. Enter at 1.5 so a single stray burst can't
+// grow the buffer; release below 0.5 to stop the score flapping the target and manufacturing drops.
 constexpr double kBurstHalfLifeMs = 2300.0;
 constexpr double kBurstEnterScore = 1.5;
 constexpr double kBurstReleaseScore = 0.5;
 
-// Lazy-shrink dwell: the effective target may step down only after the desired target has
-// stayed below it for this long. Under slot-type network jitter the RFC-J estimate wobbles
-// across a depth boundary for ~a second at a time while the queue drains in every gap; an
-// undelayed shrink lowered the ceiling right before the next clump and culled it (measured:
-// the seconds with a momentary target dip carried a disproportionate share of the drops).
+// Lazy-shrink dwell: step the effective target down only after the desired target has stayed below
+// it this long, so a momentary dip can't lower the ceiling right before the next clump and cull it.
 constexpr double kShrinkDwellMs = 1500.0;
 
 using steady_clock = std::chrono::steady_clock;
@@ -133,11 +121,9 @@ void Pacer::init(const std::shared_ptr<DX::DeviceResources> &res, int streamFps,
 	m_LastSyncTarget = 0;
 	m_ewmaVsyncDriftQpc = MsToQpc(0.0001);
 
-	// Reset the PACING_ADAPTIVE signals so a reconnect starts at the low-latency floor.
-	// init() re-runs on the singleton for every stream start, so the arrival state must be
-	// cleared too: otherwise the first submitFrame() after a reconnect measures a multi-second
-	// inter-arrival gap against the previous session's timestamp, spiking the RFC-3550 jitter
-	// EWMA and pinning the buffer target at the cap for ~a second exactly when we want the floor.
+	// Reset the adaptive signals so a reconnect starts at the low-latency floor: init() re-runs on
+	// the singleton per stream, and a stale inter-arrival gap would otherwise spike the RFC-3550
+	// jitter EWMA and pin the buffer at the cap exactly when we want the floor.
 	m_RecentMaxDecodeMs.store(0.0, std::memory_order_relaxed);
 	m_LastDecodeObsQpc = 0;
 	m_ArrivalJitterMs.store(0.0, std::memory_order_relaxed);
@@ -287,11 +273,8 @@ bool Pacer::renderOnMainThread(std::shared_ptr<VideoRenderer> &sceneRenderer) {
 
 	const int mode = m_PacingMode.load(std::memory_order_acquire);
 
-	// Only PACING_ADAPTIVE grows the buffer (it raises FrameQueue's high-water and the effective
-	// target). The high-water is otherwise reset only by init(), so a runtime switch OUT of
-	// Adaptive would leave it elevated and let IMMEDIATE/DISPLAY_LOCKED stand a deeper queue
-	// (added latency). Restore the low-latency floor here so leaving Adaptive is clean and a
-	// later switch back starts fresh instead of from the previous grown state.
+	// Only ADAPTIVE grows the buffer; init() otherwise resets the high-water. Restore the
+	// low-latency floor when leaving Adaptive so IMMEDIATE/DISPLAY_LOCKED don't inherit a grown queue.
 	if (mode != PACING_ADAPTIVE) {
 		m_EffectiveTarget = 1;
 		m_ShrinkArmedQpc = 0;
@@ -305,16 +288,13 @@ bool Pacer::renderOnMainThread(std::shared_ptr<VideoRenderer> &sceneRenderer) {
 	if (mode == PACING_DISPLAY_LOCKED) {
 		return renderModeDisplayLocked(sceneRenderer);
 	} else {
-		// IMMEDIATE and ADAPTIVE share the immediate render path; they differ only in
-		// how many older frames are dropped before rendering.
 		return renderModeImmediate(sceneRenderer);
 	}
 }
 
-// Dequeue a new frame if available and immediately render it. When no new frame is available
-// skips Present and relies on the system to continue showing the previous frame.
-// Handles both PACING_IMMEDIATE (render the newest frame, drop all older) and PACING_ADAPTIVE
-// (drop down to a jitter-sized target, keeping a small buffer to absorb transient spikes).
+// Dequeue and immediately render the newest frame, skipping Present when none is ready.
+// IMMEDIATE drops all older frames; ADAPTIVE drops down to a small jitter-sized target, keeping a
+// buffer to absorb transient spikes.
 // Pros: lowest latency, output framerate matches input framerate
 // Cons: only works well on Xbox Series for some reason
 bool Pacer::renderModeImmediate(std::shared_ptr<VideoRenderer> &sceneRenderer) {
@@ -323,27 +303,22 @@ bool Pacer::renderModeImmediate(std::shared_ptr<VideoRenderer> &sceneRenderer) {
 	AVFrame *newFrame = nullptr;
 
 	if (mode == PACING_ADAPTIVE) {
-		// Size the drop target to recent judder (adaptive-playout style): on a clean link
-		// target == 1 (identical to IMMEDIATE), and it grows only enough to absorb transient
-		// spikes, then reclaims. Two buffer-independent signals (so the controller can't
-		// oscillate) -> take the larger: network arrival jitter, and decoder overrun. Drop the
-		// OLDEST frames down to the target, then render the oldest remaining (FIFO when buffering).
+		// Size the drop target to recent judder: 1 on a clean link (== IMMEDIATE), growing only to
+		// absorb transient spikes, then reclaiming. Signals are buffer-independent so the controller
+		// can't oscillate; take the max, drop oldest frames down to it, render FIFO when buffering.
 		int target = 1;
 		// Leniency only helps when the source can outpace the display; otherwise a backlog
 		// can't be sustained by rate, so stay strict (lowest latency).
 		if (m_StreamFps >= m_RefreshRate) {
 			const double frameMs = m_FrameCadence.streamPeriodMs();
 			if (frameMs > 0.0) {
-				// Network-jitter term (RFC 3550 J, a mean deviation): cover the jitter tail,
-				// rounded to whole frames; trivial jitter rounds to 0 extra -> target 1.
+				// Network-jitter term: cover the RFC-3550 jitter tail, rounded to whole frames.
 				const double jitterMs = m_ArrivalJitterMs.load(std::memory_order_acquire);
 				const double kJitterSafety = 2.0;
 				int jitterDepth = 1 + static_cast<int>(((jitterMs * kJitterSafety) / frameMs) + 0.5);
 
-				// Complex-scene term: grow when the decoder OVERRUNS the per-frame budget. At or
-				// under the decode ceiling (overrun <= 0) this is 1, so merely running the decoder
-				// hard at a steady rate stays at lowest latency; only genuine overruns (a hard
-				// frame taking > 1 period) buffer, and it reclaims as the decaying max falls.
+				// Decode term: grow only when a frame overruns its period budget (steady hard
+				// decoding stays at 1); reclaims as the decaying max falls.
 				const double decodeMs = m_RecentMaxDecodeMs.load(std::memory_order_relaxed);
 				int decodeDepth = 1;
 				const double overrunMs = decodeMs - frameMs;
@@ -353,12 +328,9 @@ bool Pacer::renderModeImmediate(std::shared_ptr<VideoRenderer> &sceneRenderer) {
 					decodeDepth = 1 + extra;
 				}
 
-				// Delivery-phase term: recurring clustered arrivals mean the arrival phase runs
-				// at the present deadline (starve + catch-up pairs at depth 1, the validated
-				// "heavy scene" judder). One buffered frame absorbs the pair completely: the
-				// starved slot presents the spare, the burst refills it, nothing is dropped.
-				// Bursts persist regardless of depth, so this reclaims only when the phase
-				// heals. Enter/release hysteresis keeps one episode = one solid depth-2 window.
+				// Burst term: recurring clustered arrivals ("heavy scene" judder) cause starve+
+				// catch-up drops at depth 1; one buffered frame absorbs the pair. Hysteresis keeps
+				// one episode = one depth-2 window.
 				double burstScore = m_ArrivalBurstScore.load(std::memory_order_relaxed);
 				if (burstScore >= kBurstEnterScore) {
 					m_BurstLatched = true;
@@ -376,12 +348,8 @@ bool Pacer::renderModeImmediate(std::shared_ptr<VideoRenderer> &sceneRenderer) {
 				}
 			}
 		}
-		// Instant grow, lazy shrink: raising the target takes effect immediately (absorb the
-		// trouble NOW), but lowering it never drops a frame — the effective target steps down
-		// only at a natural drain moment (queue empty), which the 119.88-in-120Hz cadence
-		// guarantees within seconds, and only after the desired value has stayed below it for
-		// the dwell period (momentary signal dips must not lower the ceiling into an oncoming
-		// clump). Measured motivation: reclaim-drops during flapping were the visible skips.
+		// Instant grow, lazy shrink: raise immediately, but lower only at a drain moment (queue
+		// empty) after the dwell, so reclaiming never itself drops a frame.
 		if (target >= m_EffectiveTarget) {
 			m_EffectiveTarget = target;
 			m_ShrinkArmedQpc = 0;
@@ -390,9 +358,7 @@ bool Pacer::renderModeImmediate(std::shared_ptr<VideoRenderer> &sceneRenderer) {
 		}
 		const int desiredTarget = target;
 		target = m_EffectiveTarget;
-		// Let the queue hold `target` frames plus one arriving, so a grown buffer retains the
-		// NEWEST frames instead of the high-water alternate-drop discarding new arrivals. Only
-		// touch the (locked) high-water on an actual change.
+		// High-water = target + 1 so a grown buffer keeps the newest frames; touch it only on change.
 		{
 			int hwm = target + 1;
 			if (hwm < FRAME_QUEUE_HIGH) hwm = FRAME_QUEUE_HIGH;
@@ -410,8 +376,7 @@ bool Pacer::renderModeImmediate(std::shared_ptr<VideoRenderer> &sceneRenderer) {
 			av_frame_free(&old);
 			++droppedToCatchUp;
 		}
-		// A drain moment (empty queue) makes shrinking free; the dwell gate above decides
-		// whether the shrink is actually due.
+		// A drain moment (empty queue) makes shrinking free; the dwell gate decides if it's due.
 		const bool shrinkDue = m_ShrinkArmedQpc != 0 && QpcToMs(QpcNow() - m_ShrinkArmedQpc) >= kShrinkDwellMs;
 		newFrame = FrameQueue::instance().dequeue();
 		if (!newFrame) {
@@ -426,9 +391,7 @@ bool Pacer::renderModeImmediate(std::shared_ptr<VideoRenderer> &sceneRenderer) {
 			m_ShrinkArmedQpc = 0;
 		}
 	} else {
-		// PACING_IMMEDIATE: lowest latency. Render the NEWEST available frame and discard
-		// any older ones, so no standing buffer can accumulate. In steady state (<= 1
-		// queued) the loop finds nothing extra and drops nothing.
+		// IMMEDIATE: render the newest frame and discard older ones so no standing buffer forms.
 		newFrame = FrameQueue::instance().dequeue();
 		if (!newFrame) {
 			return false; // no frame, don't Present()
@@ -557,12 +520,8 @@ int64_t Pacer::getCurrentFramePts() {
 
 // end main thread
 
-// called by decoder thread
-// Per-frame decode time, fed by the decoder thread for NON-IDR frames only (an IDR is large
-// and slow by nature; including it would falsely pin the buffer). Keeps a decaying max so a
-// complex scene raises the signal and a clean scene reclaims latency; the decay uses the
-// actual elapsed time between observations, so it's fps-independent. Single writer (decoder
-// thread); the render thread only reads m_RecentMaxDecodeMs, so the RMW here is race-free.
+// called by decoder thread, NON-IDR frames only (an IDR is naturally slow and would falsely pin the
+// buffer). Decaying max of per-frame decode time. Single writer, so the read-modify-write is race-free.
 void Pacer::observeDecodeMs(double decodeMs) {
 	int64_t now = QpcNow();
 	double cur = m_RecentMaxDecodeMs.load(std::memory_order_relaxed);
@@ -582,9 +541,7 @@ void Pacer::submitFrame(AVFrame *frame) {
 		m_FrameCadence.observeFramePts(frame->pts);
 	}
 
-	// Measure frame-arrival jitter as the RFC 3550 smoothed deviation of the actual
-	// inter-arrival time from the expected frame period: J += (|D| - J)/16. Read by
-	// PACING_ADAPTIVE to size the buffer target. Cheap; decoder thread only.
+	// RFC 3550 arrival-jitter estimate: J += (|D| - J)/16, D = actual vs expected inter-arrival.
 	int64_t now = QpcNow();
 	double arrivalDeltaMs = 0.0;
 	if (m_HaveLastEnqueue) {
@@ -597,11 +554,8 @@ void Pacer::submitFrame(AVFrame *frame) {
 		double j = m_ArrivalJitterMs.load(std::memory_order_acquire);
 		m_ArrivalJitterMs.store(j + (dev - j) / 16.0, std::memory_order_release);
 
-		// Producer-side burst signal: this frame arrived clustered with the previous one
-		// (< 0.6 period apart), which at target 1 forces a catch-up drop. Measured here at
-		// enqueue by timestamp -> independent of the render buffer depth. Feeds the decaying
-		// controller score (single writer: this thread); the decay uses the actual elapsed
-		// time, so it's fps-independent.
+		// Burst signal: this frame arrived clustered (< 0.6 period) with the previous one. Measured
+		// at enqueue by timestamp, so it's independent of the render buffer depth.
 		double burstScore = m_ArrivalBurstScore.load(std::memory_order_relaxed) *
 		                    exp2(-arrivalDeltaMs / kBurstHalfLifeMs);
 		if (periodMs > 0.0 && arrivalDeltaMs < 0.6 * periodMs) {
